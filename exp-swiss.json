@@ -1,0 +1,145 @@
+{
+    "folder": "data/swiss",
+    "nominalDemand": 1347686,
+    "rolls": 18,
+    "commodityGenerationInterval": 10,
+    "outsideOption": 180,
+    "demands": [
+        {
+            "factor": 0.35,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.4,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.45,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.5,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.55,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.6,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.65,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.7,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.75,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.8,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.85,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.9,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 0.95,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.05,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.1,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.15,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.2,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.25,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.3,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.35,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.4,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.45,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.5,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.55,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.6,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.65,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.7,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.75,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.8,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.85,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.9,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 1.95,
+            "num_shuffles": 0
+        },
+        {
+            "factor": 2,
+            "num_shuffles": 0
+        }
+    ]
+}

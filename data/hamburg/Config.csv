@@ -1,0 +1,4 @@
+# config_key; value
+ptn_name; "S-Bahn Hamburg"
+period_length; 10
+ean_change_penalty; 5

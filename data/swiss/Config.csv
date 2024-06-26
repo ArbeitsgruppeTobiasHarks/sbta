@@ -1,0 +1,4 @@
+# config_key; value
+ptn_name; "Fernverkehr Schweiz"
+period_length; 120
+ean_change_penalty; 0
