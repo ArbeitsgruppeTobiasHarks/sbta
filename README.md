@@ -35,6 +35,10 @@ Finally, make the shell scripts executable:
 chmod +x all-experiments.sh experiment.sh
 ```
 
+## Obtaining the data
+
+You can obtain network instances from [TimPassLib](https://timpasslib.aalto.fi/).
+The pre-configured experiments `exp-NETWORK.json` expect network instances to be located in the subfolder `data/NETWORK`.
 
 ## Running the experiments
 
