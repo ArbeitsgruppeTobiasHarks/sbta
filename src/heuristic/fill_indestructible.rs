@@ -1,13 +1,20 @@
 use log::{debug, info};
 
 use crate::{
-    a_star::{a_star, a_star_reachable_within, compute_a_star_table, AStarTable},
-    col::{set_new, HashSet},
+    col::HashSet,
     flow::Flow,
-    graph::{DescribePath, EdgeIdx, EdgePayload, EdgeType, FVal, Graph, NodeIdx, PathBox, EPS_L},
-    heuristic::{arrival_of_path, get_longest_feasible_extension},
+    graph::{CostCharacteristic, DescribePath, EdgeIdx, EdgePayload, EdgeType, Graph, NodeIdx},
+    heuristic::get_longest_feasible_extension,
     iter::par_map_until::{ParMapResult, ParMapUntil},
-    paths_index::{PathId, PathsIndex},
+    path_index::{PathId, PathsIndex},
+    primitives::{EPS_L, FVal},
+    shortest_path::{
+        a_star::{AStarTable, compute_a_star_table},
+        best_paths::{
+            edge_is_not_a_boarding_edge_of_a_full_driving_edge, find_shortest_path_choice,
+            find_shortest_path_fixed,
+        },
+    },
 };
 
 pub fn fill_indestructible_paths(
@@ -91,29 +98,16 @@ fn fill_indestructible_optimal_paths<B: TryHarder>(
     // Move flow away from outside option only.
 
     // If try_harder is set, we do a more advanced but more expensive check:
-    // Use boarding edges also, if the previous dwell edge is no longer
+    // Use boarding edges also, if the previous stay-on edge is no longer
     // accessible by any commodity.
     // Here "accessible" means, it is not on any s-t-path of any commodity with positive flow on their outside option.
 
     let edge_okay_opt = |_: EdgeIdx, edge: &EdgePayload| -> bool {
-        if !matches!(edge.edge_type, EdgeType::Board(_)) {
-            return true;
-        }
-        let drive_edge = graph.node(edge.to).outgoing[0];
-        let drive_edge_flow = flow.on_edge(drive_edge);
-
-        let capacity = {
-            let drive_edge = graph.edge(drive_edge);
-            if let EdgeType::Drive(capacity) = drive_edge.edge_type {
-                capacity
-            } else {
-                panic!("Drive edge is not a drive edge!");
-            }
-        };
-        let slack = capacity - drive_edge_flow;
-        slack > EPS_L
+        edge_is_not_a_boarding_edge_of_a_full_driving_edge(edge, flow, graph)
     };
 
+    let path_reachable: Option<HashSet<NodeIdx>> = None;
+    /*
     let path_reachable: Option<HashSet<NodeIdx>> = if !B::TRY_HARDER {
         None
     } else {
@@ -144,7 +138,7 @@ fn fill_indestructible_optimal_paths<B: TryHarder>(
             path_reach_set.extend(commodity_reachable);
         }
         Some(path_reach_set)
-    };
+    };*/
 
     let edge_okay_indestructible = |id: EdgeIdx, edge: &EdgePayload| -> bool {
         if !edge_okay_opt(id, edge) {
@@ -157,8 +151,8 @@ fn fill_indestructible_optimal_paths<B: TryHarder>(
             .node(edge.to)
             .incoming
             .iter()
-            .find(|prev_edge_id| matches!(graph.edge(**prev_edge_id).edge_type, EdgeType::Dwell))
-            .map(|dwell_edge| graph.node(graph.edge(*dwell_edge).from).incoming[0]);
+            .find(|prev_edge_id| matches!(graph.edge(**prev_edge_id).edge_type, EdgeType::StayOn))
+            .map(|stay_on_edge| graph.node(graph.edge(*stay_on_edge).from).incoming[0]);
 
         match previous_drive_edge {
             None => true,
@@ -192,102 +186,91 @@ fn fill_indestructible_optimal_paths<B: TryHarder>(
         )
         .par_map_until(|(idx, &path_id)| {
             let path = paths_index.path(path_id);
-            let commodity = graph.commodity(path.commodity_idx());
-            let source_id = match commodity.spawn_node {
-                None => return ParMapResult::NotFound(()),
-                Some(it) => it,
-            };
+            let commodity_idx = path.commodity_idx();
+            let commodity = graph.commodity(commodity_idx);
             let destination = commodity.od_pair.destination;
-            let max_arrival_time = arrival_of_path(path, graph, commodity) - 1;
-            let result_opt = a_star(
-                graph,
-                a_star_table,
-                source_id,
-                destination,
-                edge_okay_opt,
-                false,
-                max_arrival_time,
-            );
-            let destination_node_idx = match result_opt.destination {
-                None => {
-                    // We can actually ignore any further demand of this commodity; but that's future work.
-                    return ParMapResult::NotFound(());
+            let indestructible_path_opt = match &commodity.cost_characteristic {
+                CostCharacteristic::FixedDeparture(fixed) => {
+                    let max_time = path.arrival_time(graph, fixed) - 1;
+                    let Some(opt_path) = find_shortest_path_fixed(
+                        commodity_idx,
+                        destination,
+                        fixed.spawn_node,
+                        max_time,
+                        edge_okay_opt,
+                        graph,
+                        a_star_table,
+                        false,
+                    )
+                    .0
+                    else {
+                        return ParMapResult::NotFound(());
+                    };
+                    let opt_time = opt_path.payload().arrival_time(graph, fixed);
+                    find_shortest_path_fixed(
+                        commodity_idx,
+                        destination,
+                        fixed.spawn_node,
+                        opt_time,
+                        edge_okay_indestructible,
+                        graph,
+                        a_star_table,
+                        false,
+                    )
+                    .0
                 }
-                Some(it) => it,
+                CostCharacteristic::DepartureTimeChoice(choice) => {
+                    let max_cost = path.cost_choice(commodity, choice, graph) - 1;
+                    let origin = commodity.od_pair.origin;
+                    let Some(opt_path) = find_shortest_path_choice(
+                        commodity_idx,
+                        choice,
+                        origin,
+                        destination,
+                        max_cost,
+                        edge_okay_opt,
+                        graph,
+                        a_star_table,
+                        false,
+                    )
+                    .0
+                    else {
+                        return ParMapResult::NotFound(());
+                    };
+                    let opt_cost = opt_path.payload().cost_choice(commodity, choice, graph);
+                    find_shortest_path_choice(
+                        commodity_idx,
+                        choice,
+                        origin,
+                        destination,
+                        opt_cost,
+                        edge_okay_indestructible,
+                        graph,
+                        a_star_table,
+                        false,
+                    )
+                    .0
+                }
             };
-            // Check if optimal time is reachable with said set of boarding edges.
-            let arrival_opt = graph.node(destination_node_idx).time;
-            let result_indestructible = a_star(
-                graph,
-                a_star_table,
-                source_id,
-                destination,
-                edge_okay_indestructible,
-                false,
-                arrival_opt,
-            );
-
-            let destination_node_idx = match result_indestructible.destination {
-                None => return ParMapResult::NotFound(()),
-                Some(it) => it,
+            let Some(indestructible_path) = indestructible_path_opt else {
+                return ParMapResult::NotFound(());
             };
-            // There is an indestructible, optimal path!
-            ParMapResult::Found(Box::new((
-                idx,
-                source_id,
-                path_id,
-                result_indestructible,
-                destination_node_idx,
-            )))
+            ParMapResult::Found(Box::new((idx, path_id, indestructible_path)))
         });
-    let (old_path_idx, source_id, old_path_id, result_indestructible, destination_node_idx) =
-        match indestructible_result.last() {
-            None => return None,
-            Some(ParMapResult::NotFound(_)) => return None,
-            Some(ParMapResult::Found(it)) => *it,
-        };
+    let (old_path_idx, old_path_id, indestructible_path) = match indestructible_result.last()? {
+        ParMapResult::NotFound(_) => return None,
+        ParMapResult::Found(it) => *it,
+    };
 
-    // There is a indestructible, optimal path!
-    // Let's find it by backtracking.
-    let mut path = vec![];
-    let mut cur_node = (destination_node_idx, graph.node(destination_node_idx));
-
-    while cur_node.0 != source_id {
-        let chosen_edge = cur_node
-            .1
-            .incoming
-            .iter()
-            .find_map(|&edge_idx| {
-                let edge = graph.edge(edge_idx);
-                if !result_indestructible.astar_reached.contains(&edge.from) {
-                    return None;
-                }
-                if !edge_okay_indestructible(edge_idx, edge) {
-                    return None;
-                }
-                Some((edge_idx, edge))
-            })
-            .unwrap();
-        path.push(chosen_edge.0);
-        cur_node = (chosen_edge.1.from, graph.node(chosen_edge.1.from));
-    }
-
-    path.reverse();
-
-    let old_path = paths_index.path(old_path_id);
-    let path = PathBox::new(old_path.commodity_idx(), path.into_iter());
-
-    let new_path_id = paths_index.transfer_path(path);
+    let new_path_id = paths_index.transfer_path(indestructible_path);
 
     let mut direction = Flow::new();
     direction.add_flow_onto_path(paths_index, old_path_id, -1.0, false, false);
     direction.add_flow_onto_path(paths_index, new_path_id, 1.0, false, false);
 
-    if B::TRY_HARDER {
-        print!("TRYHARD: ");
-    }
     debug!(
-        "Swap to indestructible: {:}",
+        "Swap to indestructible {:?}: {:}",
+        new_path_id,
         DescribePath::describe(paths_index.path(new_path_id), graph)
     );
     let swap_amount = get_longest_feasible_extension(graph, flow, &direction, true, true);

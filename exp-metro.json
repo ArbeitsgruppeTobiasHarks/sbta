@@ -1,0 +1,16 @@
+{
+    "folder": "data/metro",
+    "nominalDemand": 3039504,
+    "defaultVehicleCapacity": 1086,
+    "rolls": 72,
+    "rollsWithoutDemand": 4,
+    "timeUnitsInHour": 600,
+    "commodityGenerationInterval": 100,
+    "outsideOption": 1800,
+    "demands": [
+        {
+            "factor": 1,
+            "num_shuffles": 0
+        }
+    ]
+}

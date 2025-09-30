@@ -1,16 +1,18 @@
 use itertools::Itertools;
 use log::{debug, warn};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::cmp::max;
 use std::fmt::Write;
 use std::{
     cmp::min,
-    collections::{hash_map::Entry, VecDeque},
+    collections::{VecDeque, hash_map::Entry},
 };
 
 use crate::{
-    col::{map_new, set_new, HashMap, HashSet},
-    graph::{DescribePath, EdgeIdx, FVal, Graph, EPS},
-    paths_index::{PathId, PathsIndex},
+    col::{HashMap, HashSet, map_new, set_new},
+    graph::{DescribePath, EdgeIdx, Graph},
+    path_index::{PathId, PathsIndex},
+    primitives::{EPS, FVal},
 };
 
 #[derive(Clone, Debug)]
@@ -42,7 +44,7 @@ impl Flow {
             commodity_a
                 .0
                 .cmp(&commodity_b.0)
-                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0.0.cmp(&b.0.0))
         });
 
         for (&path, &flow_val) in paths_vec {
@@ -59,6 +61,22 @@ impl Flow {
             .unwrap();
         }
         out
+    }
+
+    pub fn get_demand_outside(&self, paths: &PathsIndex) -> FVal {
+        self.path_flow_map()
+            .iter()
+            .filter(|it| paths.path(*it.0).is_outside())
+            .map(|it| it.1)
+            .sum()
+    }
+
+    pub fn get_demand_inside(&self, paths: &PathsIndex) -> FVal {
+        self.path_flow_map()
+            .iter()
+            .filter(|&(&path_id, _)| !paths.path(path_id).is_outside())
+            .map(|(_, &flow_val)| flow_val)
+            .sum()
     }
 
     pub fn add_flow_onto_path(
@@ -259,7 +277,7 @@ impl Flow {
             .iter()
             .map(|(&path_id, &flow_val)| {
                 let path = paths.path(path_id);
-                let cost = path.cost(graph, graph.commodity(path.commodity_idx()));
+                let cost = path.cost(graph.commodity(path.commodity_idx()), graph);
                 flow_val * (cost as f64)
             })
             .sum()
@@ -316,10 +334,10 @@ impl CycleAwareFlow {
         &mut self,
         paths: &PathsIndex,
         mut direction: Flow,
-        before_dir_change: impl FnOnce(&Flow, &Flow),
+        on_flow_changed: impl FnOnce(&Flow, &Flow),
     ) {
         self.flow.add(&direction, paths, true, false);
-        before_dir_change(&self.flow, &direction);
+        on_flow_changed(&self.flow, &direction);
         let l1norm = direction.l1norm();
         assert!(l1norm > 0.0, "Direction has L1 norm 0");
         direction.scale_by(1.0 / l1norm);
@@ -337,8 +355,10 @@ impl CycleAwareFlow {
         // If the rolling average is smaller than the expected step size, we should afford to check longer cycles.
         // More specifically, we check cycles of length up to 32*2^(log_10(1/rolling_avg)).
         // E.g., for a rolling average of 0.001, we check cycles of length up to 256.
+        //                             of 1.0  , we check cycles of length up to 32
 
         let max_cycle_length = (32.0 * 2.0_f64.powf((1.0 / rolling_avg).log10())) as usize;
+        let max_cycle_length = max(max_cycle_length, 64);
         let max_cycle_length = min(max_cycle_length, self.directions.len() / 2);
         debug!(
             "Checking cycles of length up to {} (roll.avg. {:})",

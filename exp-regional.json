@@ -1,15 +1,15 @@
 {
-    "folder": "data/hamburg",
-    "nominalDemand": 750000,
-    "defaultVehicleCapacity": 1000,
+    "folder": "data/regional",
+    "nominalDemand": 16298.4,
+    "defaultVehicleCapacity": 500,
     "timeUnitsInHour": 60,
-    "rolls": 108,
-    "rollsWithoutDemand": 6,
+    "rolls": 18,
+    "rollsWithoutDemand": 1,
     "commodityGenerationInterval": 10,
     "outsideOption": 180,
     "demands": [
         {
-            "factor": 1,
+            "factor": 16,
             "num_shuffles": 0
         }
     ]

@@ -1,0 +1,16 @@
+{
+    "folder": "data/long-distance",
+    "nominalDemand": 385868,
+    "defaultVehicleCapacity": 1200,
+    "timeUnitsInHour": 60,
+    "rolls": 18,
+    "rollsWithoutDemand": 1,
+    "commodityGenerationInterval": 10,
+    "outsideOption": 360,
+    "demands": [
+        {
+            "factor": 16,
+            "num_shuffles": 0
+        }
+    ]
+}

@@ -7,10 +7,12 @@ use num_traits::FromPrimitive;
 
 use crate::{
     graph::{
-        CommodityPayload, EdgePayload, EdgeType, FromRawError, Graph, NodeIdx, NodeRawPayload,
-        NodeType, ODPair, StationIdx, VehicleId,
+        self, CommodityPayload, CostCharacteristic, EdgePayload, EdgeType, FixedDeparture,
+        FromRawError, Graph, NodeIdx, NodeRawPayload, NodeType, ODPair, StationIdx,
     },
+    primitives::Time,
     timpass::LineInfoMap,
+    vehicle::VehicleId,
 };
 
 #[derive(FromPrimitive)]
@@ -25,8 +27,8 @@ enum DBEdgeType {
     Board = 0,
     Wait = 1,
     Drive = 2,
-    Alight = 3,
-    Dwell = 5,
+    GetOff = 3,
+    StayOn = 5,
 }
 
 pub fn export_graph(graph: &Graph, line_info_map: &LineInfoMap, out_filename: &str) {
@@ -79,11 +81,17 @@ pub fn export_graph(graph: &Graph, line_info_map: &LineInfoMap, out_filename: &s
             "CREATE TABLE commodity (
         id INTEGER PRIMARY KEY NOT NULL,
         origin INTEGER NOT NULL,
-        departure_time INTEGER NOT NULL,
         destination INTEGER NOT NULL,
-        outside_latest_arrival INTEGER NOT NULL,
         demand REAL NOT NULL,
-        spawn_node INTEGER
+        outside_option INTEGER NOT NULL,
+        cost_characteristic INTEGER NOT NULL,
+        fixed_departure_time INTEGER,
+        fixed_outside_latest_arrival INTEGER,
+        fixed_spawn_node INTEGER,
+        choice_target_arrival_time INTEGER,
+        choice_delay_penalty_factor INTEGER,
+        choice_spawn_node_from INTEGER,
+        choice_spawn_node_to INTEGER
     )",
         )
         .unwrap();
@@ -142,8 +150,8 @@ pub fn export_graph(graph: &Graph, line_info_map: &LineInfoMap, out_filename: &s
                 EdgeType::Board(_) => DBEdgeType::Board,
                 EdgeType::Wait => DBEdgeType::Wait,
                 EdgeType::Drive(_) => DBEdgeType::Drive,
-                EdgeType::Alight => DBEdgeType::Alight,
-                EdgeType::Dwell => DBEdgeType::Dwell,
+                EdgeType::GetOff => DBEdgeType::GetOff,
+                EdgeType::StayOn => DBEdgeType::StayOn,
             } as i64,
         ))
         .unwrap();
@@ -153,7 +161,7 @@ pub fn export_graph(graph: &Graph, line_info_map: &LineInfoMap, out_filename: &s
                 EdgeType::Board(vehicle_id) => Some(vehicle_id.0 as i64),
                 _ => panic!("Boarding edge is not a boarding edge!"),
             },
-            EdgeType::Alight | EdgeType::Dwell => match graph
+            EdgeType::GetOff | EdgeType::StayOn => match graph
                 .boarding_edge(graph.node(edge.from).incoming[0])
                 .unwrap()
                 .1
@@ -169,19 +177,41 @@ pub fn export_graph(graph: &Graph, line_info_map: &LineInfoMap, out_filename: &s
         stmt.reset().unwrap();
     }
     let mut stmt = connection
-        .prepare("INSERT INTO commodity (id, origin, departure_time, destination, outside_latest_arrival, demand, spawn_node) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .prepare("INSERT INTO commodity (id, origin, destination, demand, outside_option, cost_characteristic,\
+        fixed_departure_time, \
+        fixed_outside_latest_arrival, \
+        fixed_spawn_node, \
+        choice_target_arrival_time, \
+        choice_delay_penalty_factor, \
+        choice_spawn_node_from, \
+        choice_spawn_node_to) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .unwrap();
     for (idx, commodity) in graph.commodities() {
         stmt.bind((1, idx.0 as i64)).unwrap();
         stmt.bind((2, commodity.od_pair.origin.0 as i64)).unwrap();
-        stmt.bind((3, commodity.od_pair.departure as i64)).unwrap();
-        stmt.bind((4, commodity.od_pair.destination.0 as i64))
+        stmt.bind((3, commodity.od_pair.destination.0 as i64))
             .unwrap();
-        stmt.bind((5, commodity.outside_latest_arrival as i64))
-            .unwrap();
-        stmt.bind((6, commodity.demand)).unwrap();
-        stmt.bind((7, commodity.spawn_node.map(|it| it.0 as i64)))
-            .unwrap();
+        stmt.bind((4, commodity.demand as f64)).unwrap();
+        stmt.bind((5, commodity.outside_option as i64)).unwrap();
+        match &commodity.cost_characteristic {
+            CostCharacteristic::FixedDeparture(fixed) => {
+                stmt.bind((6, 0)).unwrap();
+                stmt.bind((7, fixed.departure as i64)).unwrap();
+                stmt.bind((8, fixed.outside_latest_arrival as i64)).unwrap();
+                stmt.bind((9, fixed.spawn_node.map(|it| it.0 as i64)))
+                    .unwrap();
+            }
+            CostCharacteristic::DepartureTimeChoice(choice) => {
+                stmt.bind((6, 1)).unwrap();
+                stmt.bind((10, choice.target_arrival_time as i64)).unwrap();
+                stmt.bind((11, choice.delay_penalty_factor as i64)).unwrap();
+                stmt.bind((12, choice.spawn_node_range.map(|it| it.0.0 as i64)))
+                    .unwrap();
+                stmt.bind((13, choice.spawn_node_range.map(|it| it.1.0 as i64)))
+                    .unwrap();
+            }
+        }
         stmt.next().unwrap();
         stmt.reset().unwrap();
     }
@@ -215,7 +245,7 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
 
     struct DBNode {
         station: i64,
-        time: u32,
+        time: Time,
         node_type: DBNodeType,
     }
 
@@ -239,7 +269,7 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
                     });
                 }
                 let station = it.read(1);
-                let time = it.read::<i64, _>(2) as u32;
+                let time = it.read::<i64, _>(2) as Time;
                 let node_type: i64 = it.read(3);
                 let node_type: DBNodeType =
                     DBNodeType::from_i64(node_type).ok_or(ImportGraphError::InvalidNodeType {
@@ -320,15 +350,24 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
 
     struct DBCommodity {
         origin: u32,
-        departure_time: u32,
         destination: u32,
-        outside_latest_arrival: u32,
         demand: f64,
-        spawn_node: Option<u32>,
+        outside_option: Time,
+        cost_characteristic: i64,
+        fixed_departure_time: Option<Time>,
+        fixed_outside_latest_arrival: Option<Time>,
+        fixed_spawn_node: Option<u32>,
+        choice_target_arrival_time: Option<Time>,
+        choice_delay_penalty_factor: Option<Time>,
+        choice_spawn_node_from: Option<u32>,
+        choice_spawn_node_to: Option<u32>,
     }
 
     let db_commodities: Vec<_> = connection
-    .prepare("SELECT id, origin, departure_time, destination, outside_latest_arrival, demand, spawn_node FROM commodity ORDER BY id ASC;")
+    .prepare("SELECT id, origin, destination, demand, outside_option, \
+    cost_characteristic, fixed_departure_time, fixed_outside_latest_arrival, fixed_spawn_node, \
+    choice_target_arrival_time, choice_delay_penalty_factor, choice_spawn_node_from, choice_spawn_node_to \
+    FROM commodity ORDER BY id ASC;")
     .map_err(ImportGraphError::Sqlite)?
     .iter()
     .enumerate()
@@ -346,18 +385,31 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
                 });
             }
             let origin: i64 = it.read(1);
-            let departure_time: i64 = it.read(2);
-            let destination: i64 = it.read(3);
-            let outside_latest_arrival: i64 = it.read(4);
-            let demand: f64 = it.read(5);
-            let spawn_node: Option<i64> = it.read(6);
+            let destination: i64 = it.read(2);
+            let demand: f64 = it.read(3);
+            let outside_option: i64 = it.read(4);
+            let cost_characteristic: i64 = it.read(5);
+            let fixed_departure_time: Option<i64> = it.read(6);
+            let fixed_outside_latest_arrival: Option<i64> = it.read(7);
+            let fixed_spawn_node: Option<i64> = it.read(8);
+            let choice_target_arrival_time: Option<i64> = it.read(9);
+            let choice_delay_penalty_factor: Option<i64> = it.read(10);
+            let choice_spawn_node_from: Option<i64> = it.read(11);
+            let choice_spawn_node_to: Option<i64> = it.read(12);
+
             Ok(DBCommodity {
                 origin: origin as u32,
-                departure_time: departure_time as u32,
                 destination: destination as u32,
-                outside_latest_arrival: outside_latest_arrival as u32,
                 demand,
-                spawn_node: spawn_node.map(|it| it as u32)
+                outside_option: outside_option as Time,
+                cost_characteristic,
+                fixed_departure_time: fixed_departure_time.map(|it| it as Time),
+                fixed_outside_latest_arrival: fixed_outside_latest_arrival.map(|it| it as Time),
+                fixed_spawn_node: fixed_spawn_node.map(|it| it as u32),
+                choice_target_arrival_time: choice_target_arrival_time.map(|it| it as Time),
+                choice_delay_penalty_factor: choice_delay_penalty_factor.map(|it| it as Time),
+                choice_spawn_node_from: choice_spawn_node_from.map(|it| it as u32),
+                choice_spawn_node_to: choice_spawn_node_to.map(|it| it as u32),
             })
         }
     })
@@ -390,8 +442,8 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
                     from: NodeIdx(db_edge.from_node),
                     to: NodeIdx(db_edge.to_node),
                     edge_type: match db_edge.edge_type {
-                        DBEdgeType::Alight => EdgeType::Alight,
-                        DBEdgeType::Dwell => EdgeType::Dwell,
+                        DBEdgeType::GetOff => EdgeType::GetOff,
+                        DBEdgeType::StayOn => EdgeType::StayOn,
                         DBEdgeType::Wait => EdgeType::Wait,
                         DBEdgeType::Board => {
                             EdgeType::Board(VehicleId(db_edge.vehicle_id.ok_or(
@@ -422,11 +474,30 @@ pub fn import_graph(in_fname: &str) -> Result<Graph, ImportGraphError> {
             od_pair: ODPair {
                 origin: StationIdx(db_commodity.origin),
                 destination: StationIdx(db_commodity.destination),
-                departure: db_commodity.departure_time,
             },
             demand: db_commodity.demand,
-            outside_latest_arrival: db_commodity.outside_latest_arrival,
-            spawn_node: db_commodity.spawn_node.map(NodeIdx),
+            outside_option: db_commodity.outside_option,
+            cost_characteristic: match db_commodity.cost_characteristic {
+                0 => CostCharacteristic::FixedDeparture(FixedDeparture {
+                    departure: db_commodity.fixed_departure_time.unwrap(),
+                    outside_latest_arrival: db_commodity.fixed_outside_latest_arrival.unwrap(),
+                    spawn_node: db_commodity.fixed_spawn_node.map(|it| NodeIdx(it)),
+                }),
+                1 => CostCharacteristic::DepartureTimeChoice(graph::DepartureTimeChoice {
+                    target_arrival_time: db_commodity.choice_target_arrival_time.unwrap(),
+                    delay_penalty_factor: db_commodity.choice_delay_penalty_factor.unwrap(),
+                    spawn_node_range: if db_commodity.choice_spawn_node_from.is_some() {
+                        Some((
+                            NodeIdx(db_commodity.choice_spawn_node_from.unwrap()),
+                            NodeIdx(db_commodity.choice_spawn_node_to.unwrap()),
+                        ))
+                    } else {
+                        assert!(db_commodity.choice_spawn_node_to.is_none());
+                        None
+                    },
+                }),
+                _ => panic!("Invalid cost characteristic"),
+            },
         })
         .collect_vec();
 

@@ -1,33 +1,50 @@
 #![feature(alloc_layout_extra, ptr_metadata)]
+#![allow(dead_code)]
 
 use std::fs::File;
 use std::path::Path;
 use std::process::exit;
+use std::time::Duration;
+use std::{io, usize};
 
-use heuristic::eq_heuristic;
+use col::map_new;
+use heuristic::multi_phase_strategy::MultiPhaseStrategyPlan;
+use heuristic::{FlowStats, Stats, eq_heuristic, eq_heuristic_with_buffer_initial};
 use log::{error, info};
 
 use clap::{Args, Parser, Subcommand};
 use graph::Graph;
+use path_index::PathsIndex;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serialization::graph::import_graph;
+use test::random_samples;
 use timpass::unroll_timetable;
 
+use crate::cmcf::write_cmcf_input;
 use crate::serialization::flow::export_flow;
 use crate::serialization::graph::export_graph;
 
-mod a_star;
-mod best_paths;
+mod cmcf;
 mod col;
+mod collections;
 mod flow;
 mod graph;
 mod heuristic;
+mod indexer;
 mod iter;
-mod paths_index;
+mod opt;
+mod path_index;
+mod primitives;
+mod regret;
 mod relation;
 mod serialization;
+mod shortest_path;
+mod test;
+mod timer;
 mod timpass;
+mod total_order;
+mod vehicle;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,6 +64,166 @@ enum Commands {
 
     #[command(about = "Run heuristic on an unrolled graph")]
     Run(RunArgs),
+
+    #[command(about = "Run random sample")]
+    RunRandom,
+
+    #[command(about = "Compute system optimal flow")]
+    Opt(OptArgs),
+
+    #[command(about = "Write a CMCF input file given an unrolled graph")]
+    WriteCmcfInput(WriteCmcfInputArgs),
+
+    #[command(about = "Reads a CMCF output file and transforms it to a sbta-compatible flow")]
+    TransformCmcfOutput(TransformCmcfOutputArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+struct OptArgs {
+    #[arg(
+        short = 'i',
+        long,
+        default_value = "sbta-graph.sqlite3",
+        help = "The unrolled graph file."
+    )]
+    graph_filename: String,
+
+    #[arg(
+        short = 'o',
+        long,
+        default_value = "sbta-optflow.sqlite3",
+        help = "The file to write the system optimal flow to."
+    )]
+    out_filename: String,
+}
+fn main_opt(args: &OptArgs) {
+    if Path::new(&args.out_filename).exists() {
+        error!("Output file already exists: {}", args.out_filename);
+        exit(1);
+    }
+
+    let Ok(graph) = import_graph(&args.graph_filename) else {
+        error!("Could not import graph: {}", args.graph_filename);
+        exit(1);
+    };
+    let mut paths = PathsIndex::new();
+    let (flow, a_star_table, stats) = opt::compute_opt_with_stats(&graph, &mut paths);
+    let regret_map = regret::get_regret_map(&graph, &flow, &paths, &a_star_table);
+    export_flow(
+        &graph,
+        Some(&stats),
+        &flow,
+        &paths,
+        &regret_map,
+        &args.out_filename,
+    );
+}
+
+#[derive(Args, Clone, Debug)]
+struct WriteCmcfInputArgs {
+    #[arg(
+        short = 'i',
+        long,
+        default_value = "sbta-graph.sqlite3",
+        help = "The unrolled graph file."
+    )]
+    graph_filename: String,
+
+    #[arg(
+        short = 'o',
+        long,
+        help = "The file to write the CMCF input file to.",
+        default_value = "cmcf-input.sqlite3"
+    )]
+    out_filename: String,
+}
+fn main_write_cmcf_input(args: &WriteCmcfInputArgs) {
+    if Path::new(&args.out_filename).exists() {
+        error!("Output file already exists: {}", args.out_filename);
+        exit(1);
+    }
+
+    let graph = import_graph(&args.graph_filename).unwrap_or_else(|it| {
+        error!("Could not import graph:\n{:#?}", it);
+        exit(1);
+    });
+
+    write_cmcf_input(&graph, &args.out_filename).unwrap_or_else(|it| {
+        error!("Could not write CMCF input:\n{:#?}", it);
+        exit(1);
+    });
+}
+
+#[derive(Args, Clone, Debug)]
+struct TransformCmcfOutputArgs {
+    #[arg(
+        short = 'i',
+        long,
+        default_value = "cmcf-output.sqlite3",
+        help = "The CMCF output file."
+    )]
+    cmcf_output_filename: String,
+
+    #[arg(
+        short = 'g',
+        long,
+        default_value = "sbta-graph.sqlite3",
+        help = "The unrolled graph file."
+    )]
+    sbta_graph_filename: String,
+
+    #[arg(
+        short = 'o',
+        long,
+        default_value = "sbta-optflow.sqlite3",
+        help = "The file to write the sbta-compatible flow to."
+    )]
+    flow_out_filename: String,
+}
+fn main_flow_from_cmcf_output(args: &TransformCmcfOutputArgs) {
+    if Path::new(&args.flow_out_filename).exists() {
+        error!("Output file already exists: {}", args.flow_out_filename);
+        exit(1);
+    }
+
+    let graph = import_graph(&args.sbta_graph_filename).unwrap_or_else(|it| {
+        error!("Could not import graph:\n{:#?}", it);
+        exit(1);
+    });
+
+    let (flow, paths) =
+        cmcf::read_cmcf_output(&graph, &args.cmcf_output_filename).unwrap_or_else(|it| {
+            error!("Could not parse CMCF output:\n{:#?}", it);
+            exit(1);
+        });
+
+    let stats = Stats {
+        flow: FlowStats {
+            cost: flow.cost(&paths, &graph),
+            demand_outside: flow
+                .path_flow_map()
+                .iter()
+                .filter(|(path_id, _)| paths.path(**path_id).is_outside())
+                .map(|(_, v)| v)
+                .sum(),
+            max_relative_regret: 0.0,
+            mean_relative_regret: 0.0,
+            total_regret: 0.0,
+            num_regretting_paths: 0,
+            regretting_demand: 0.0,
+        },
+        computation_time: std::time::Duration::from_secs(0),
+        heuristic: None,
+    };
+
+    export_flow(
+        &graph,
+        Some(&stats),
+        &flow,
+        &paths,
+        &map_new(),
+        &args.flow_out_filename,
+    );
 }
 
 #[derive(Args, Clone, Debug)]
@@ -115,6 +292,18 @@ struct TimPassArgs {
 }
 
 #[derive(Args, Clone, Debug)]
+struct HeuristicArgs {
+    #[arg(long = "max-iterations", help = "The maximum number of iterations.")]
+    max_iterations: Option<usize>,
+
+    #[arg(
+        long = "initial-solution",
+        help = "The path to the initial solution flow. If given and a file exists, the heuristic will start from this solution. If given, and the file does not exist, the heuristic will start from scratch and write its initial solution to this path."
+    )]
+    initial_solution: Option<String>,
+}
+
+#[derive(Args, Clone, Debug)]
 struct RunArgs {
     #[arg(short = 'i', long, default_value = "sbta-graph.sqlite3")]
     graph_filename: String,
@@ -136,6 +325,9 @@ struct RunArgs {
         default_value_t = 0
     )]
     shuffle_count: usize,
+
+    #[clap(flatten)]
+    heuristic_args: HeuristicArgs,
 }
 fn main_run(args: &RunArgs) {
     if Path::new(&args.out_filename).exists() {
@@ -157,9 +349,43 @@ fn main_run(args: &RunArgs) {
         graph.shuffle_commodities(&mut rng);
     }
 
-    let (flow, paths, stats) = eq_heuristic(&graph, None, args.log_iteration_count);
+    let duration = Duration::from_secs(120 * 60);
+    let strategy_builder = MultiPhaseStrategyPlan {
+        iterations_simple: 0,
+        duration_simple: duration,
+        iterations_total_regret: 0,
+        duration_total_regret: duration,
+        iterations_total_rel_regret: usize::MAX, 
+        duration_total_rel_regret: duration,
+        iterations_max_rel_regret: 0,
+        duration_max_rel_regret: duration,
+    };
 
-    export_flow(&graph, Some(&stats), &flow, &paths, &args.out_filename)
+    let (flow, paths, stats, a_star_table) =
+        if let Some(initial_solution_path) = &args.heuristic_args.initial_solution {
+            eq_heuristic_with_buffer_initial(
+                &graph,
+                args.log_iteration_count,
+                strategy_builder,
+                initial_solution_path,
+            )
+        } else {
+            eq_heuristic(&graph, args.log_iteration_count, strategy_builder)
+        };
+
+    info!("Computing regret map...");
+
+    let regret_map = regret::get_regret_map(&graph, &flow, &paths, &a_star_table);
+
+    info!("Exporting flow...");
+    export_flow(
+        &graph,
+        Some(&stats),
+        &flow,
+        &paths,
+        &regret_map,
+        &args.out_filename,
+    )
 }
 
 #[derive(Args, Clone, Debug)]
@@ -178,6 +404,12 @@ struct UnrollArgs {
 
     #[arg(short, long, default_value = "Config.csv")]
     config_path: String,
+
+    #[arg(short, long, default_value = "Lines.csv")]
+    lines_path: String,
+
+    #[arg(long, default_value = "1000")]
+    default_vehicle_capacity: f64,
 
     #[arg(
         short = 'f',
@@ -202,6 +434,12 @@ struct UnrollArgs {
     rolls: usize,
 
     #[arg(
+        long,
+        help = "The number of rolls without generating demand at the beginning and at the end of the time frame."
+    )]
+    rolls_without_demand: usize,
+
+    #[arg(
         short = 'i',
         long,
         help = "The interval (in units of time) at which a commodity should be generated for every OD pair."
@@ -215,6 +453,9 @@ struct UnrollArgs {
     )]
     outside_option: u32,
 
+    #[arg(long, help = "Whether departure time choice should be allowed.")]
+    departure_time_choice: bool,
+
     #[arg(
         short = 'o',
         long,
@@ -222,7 +463,33 @@ struct UnrollArgs {
         default_value = "sbta-graph.sqlite3"
     )]
     out_filename: String,
+
+    #[clap(flatten)]
+    dynamic_profile_args: Option<DynamicProfileArgs>,
 }
+
+#[derive(Args, Clone, Debug)]
+struct DynamicProfileArgs {
+    #[arg(
+        long,
+        help = "The path to the dynamic profile file. A CSV file with columns [time, demand_share] where time is the time of day in hours."
+    )]
+    dp_path: String,
+
+    #[arg(
+        long,
+        help = "The time (in hours) the dynamic profile is shifted to the left."
+    )]
+    dp_shift: f64,
+
+    #[arg(
+        long,
+        help = "One hour in the time unit of the time table.",
+        default_value_t = 60.0
+    )]
+    time_units_per_hour: f64,
+}
+
 fn main_unroll(args: &UnrollArgs) {
     if Path::new(&args.out_filename).exists() {
         error!("Output file already exists: {}", args.out_filename);
@@ -233,6 +500,13 @@ fn main_unroll(args: &UnrollArgs) {
     let activities = timpass::parse_activities(File::open(&args.activities_path).unwrap()).unwrap();
     let mut demands = timpass::parse_demands(File::open(&args.demands_path).unwrap()).unwrap();
     let timetable = timpass::parse_timetable(File::open(&args.timetable_path).unwrap()).unwrap();
+    let lines = match File::open(&args.lines_path) {
+        io::Result::Ok(file) => timpass::parse_lines(file).unwrap(),
+        io::Result::Err(err) => {
+            info!("No lines file found: {}", err);
+            Vec::new().into_boxed_slice()
+        }
+    };
     let config = timpass::parse_config(File::open(&args.config_path).unwrap()).unwrap();
 
     let od_matrix_demand = demands.iter().map(|d| d.customers).sum::<f64>();
@@ -256,11 +530,15 @@ fn main_unroll(args: &UnrollArgs) {
         &activities,
         &demands,
         &timetable,
-        1000.0,
+        &lines,
+        args.default_vehicle_capacity,
         &config,
         args.rolls,
+        args.rolls_without_demand,
         args.commodity_generation_interval,
         args.outside_option,
+        args.departure_time_choice,
+        args.dynamic_profile_args.as_ref(),
     );
     info!("Number vehicles: {}", vehicles.len());
     info!("Number commodities: {}", commodities.len());
@@ -284,5 +562,9 @@ fn main() {
     match cli.command {
         Commands::Unroll(args) => main_unroll(&args),
         Commands::Run(args) => main_run(&args),
+        Commands::Opt(args) => main_opt(&args),
+        Commands::RunRandom => random_samples::run_samples(),
+        Commands::WriteCmcfInput(args) => main_write_cmcf_input(&args),
+        Commands::TransformCmcfOutput(args) => main_flow_from_cmcf_output(&args),
     }
 }

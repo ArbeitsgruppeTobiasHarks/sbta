@@ -1,10 +1,16 @@
+use std::fs::File;
+
 use serde::Deserialize;
 
 use itertools::Itertools;
 
-use crate::graph::{
-    ExtCommodity, ExtFirstStop, ExtLastStop, ExtMiddleStop, ExtStationId, ExtVehicle, FVal,
-    VehicleId,
+use crate::{
+    DynamicProfileArgs,
+    graph::{
+        ExtCommodity, ExtCostCharacteristic, ExtDepartureTimeChoice, ExtFixedDeparture, ExtODPair,
+    },
+    primitives::{FVal, Time},
+    vehicle::{ExtFirstStop, ExtLastStop, ExtMiddleStop, ExtStationId, ExtVehicle, VehicleId},
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -49,6 +55,8 @@ pub enum ActivityType {
     Headway,
     #[serde(rename = "\"sync\"")]
     Sync,
+    #[serde(rename = "\"turnaround\"")]
+    Turnaround,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -85,6 +93,13 @@ pub struct TimetableEntry {
     time: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LineCapacity {
+    #[serde(rename = "# line_id")]
+    line_id: usize,
+    capacity: f64,
+}
+
 fn reader() -> csv::ReaderBuilder {
     let mut builder = csv::ReaderBuilder::new();
     builder.trim(csv::Trim::All).delimiter(b';');
@@ -102,6 +117,9 @@ pub fn parse_demands(stream: impl std::io::Read) -> Result<Box<[Demand]>, csv::E
     reader().from_reader(stream).deserialize().collect()
 }
 pub fn parse_timetable(stream: impl std::io::Read) -> Result<Box<[TimetableEntry]>, csv::Error> {
+    reader().from_reader(stream).deserialize().collect()
+}
+pub fn parse_lines(stream: impl std::io::Read) -> Result<Box<[LineCapacity]>, csv::Error> {
     reader().from_reader(stream).deserialize().collect()
 }
 
@@ -161,13 +179,18 @@ pub fn find_first_departures(events: &[Event], activities: &[Activity]) -> Vec<u
     first_departures
 }
 
+fn floor_to_multiple(value: u32, multiple: u32) -> u32 {
+    (value / multiple) * multiple
+}
+
 pub fn extract_vehicle(
     events: &[Event],
     activities: &[Activity],
     timetable: &[TimetableEntry],
-    period_length: u32,
+    line_capacities: &[LineCapacity],
+    period_length: Time,
     first_departure_event_id: usize,
-    capacity: FVal,
+    default_capacity: FVal,
 ) -> ExtVehicle {
     let event_by_id = |event_id| {
         events
@@ -180,7 +203,7 @@ pub fn extract_vehicle(
             .iter()
             .find(|entry| entry.event_id == event_id)
             .unwrap()
-            .time as u32
+            .time as Time
     };
 
     let first_departure_event = event_by_id(first_departure_event_id);
@@ -191,7 +214,6 @@ pub fn extract_vehicle(
     };
     let mut last_departure_time = first_departure_time;
     let mut last_departure_event = first_departure_event;
-    let mut time_offset: u32 = 0;
     let mut middle_stops = Vec::new();
     loop {
         let drive_activity = activities
@@ -203,11 +225,16 @@ pub fn extract_vehicle(
             .unwrap();
         let arrival_event = event_by_id(drive_activity.to_event);
         assert!(arrival_event.event_type == EventType::Arrival);
-        let mut arrival_time = time_by_event_id(arrival_event.event_id) + time_offset;
-        if arrival_time < last_departure_time {
-            arrival_time += period_length;
-            time_offset += period_length;
-        }
+
+        let earliest_arrival_time = last_departure_time + drive_activity.lower_bound as u32;
+        let earliest_arrival_mod_period = earliest_arrival_time % period_length;
+        let arrival_time_mod_period = time_by_event_id(arrival_event.event_id);
+        let arrival_time = if arrival_time_mod_period < earliest_arrival_mod_period {
+            earliest_arrival_time.next_multiple_of(period_length) + arrival_time_mod_period
+        } else {
+            floor_to_multiple(earliest_arrival_time, period_length) + arrival_time_mod_period
+        };
+        assert!(arrival_time <= last_departure_time + drive_activity.upper_bound as u32);
         assert!(arrival_time >= last_departure_time);
 
         let station = ExtStationId(arrival_event.stop_id as u32);
@@ -219,10 +246,11 @@ pub fn extract_vehicle(
         if let Some(wait_activity) = wait_activity {
             let departure_event = event_by_id(wait_activity.to_event);
             assert!(departure_event.event_type == EventType::Departure);
-            let mut departure_time = time_by_event_id(departure_event.event_id) + time_offset;
+            let departure_time_mod_period = time_by_event_id(departure_event.event_id);
+            let mut departure_time =
+                floor_to_multiple(arrival_time, period_length) + departure_time_mod_period;
             if departure_time < arrival_time {
                 departure_time += period_length;
-                time_offset += period_length;
             }
             assert!(departure_time >= arrival_time);
 
@@ -238,6 +266,11 @@ pub fn extract_vehicle(
                 station,
                 arrival: arrival_time,
             };
+            let capacity = line_capacities
+                .iter()
+                .find(|it| it.line_id == first_departure_event.line_id)
+                .map(|it| it.capacity)
+                .unwrap_or(default_capacity);
             return ExtVehicle {
                 id: VehicleId(0),
                 capacity,
@@ -249,7 +282,7 @@ pub fn extract_vehicle(
     }
 }
 
-pub fn offset_vehicle_times(vehicle: &mut ExtVehicle, offset: u32) {
+pub fn offset_vehicle_times(vehicle: &mut ExtVehicle, offset: Time) {
     vehicle.first_stop.departure += offset;
     for middle_stop in &mut vehicle.middle_stops {
         middle_stop.arrival += offset;
@@ -272,17 +305,37 @@ impl LineInfoMap {
     }
 }
 
+#[derive(Deserialize)]
+pub struct DynamicProfileEntry {
+    pub time: u64,
+    pub demand_share: f64,
+}
+
+pub fn parse_dynamic_profile(
+    stream: impl std::io::Read,
+) -> Result<Box<[DynamicProfileEntry]>, csv::Error> {
+    csv::ReaderBuilder::default()
+        .from_reader(stream)
+        .deserialize()
+        .collect()
+}
+
 pub fn unroll_timetable(
     events: &[Event],
     activities: &[Activity],
     demands: &[Demand],
     timetable: &[TimetableEntry],
-    vehicle_capacity: FVal,
+    line_capacities: &[LineCapacity],
+    default_vehicle_capacity: FVal,
     config: &Config,
     rolls: usize,
-    commodity_generation_interval: u32,
-    outside_option: u32,
+    rolls_without_demand: usize,
+    commodity_generation_interval: Time,
+    outside_option: Time,
+    departure_time_choice: bool,
+    dynamic_profile_args: Option<&DynamicProfileArgs>,
 ) -> (Vec<ExtVehicle>, LineInfoMap, Vec<ExtCommodity>) {
+    assert!(2 * rolls_without_demand < rolls);
     let mut vehicles = Vec::new();
     let mut line_infos: Vec<LineInfo> = Vec::new();
 
@@ -295,9 +348,10 @@ pub fn unroll_timetable(
                 events,
                 activities,
                 timetable,
-                config.period_length as u32,
+                line_capacities,
+                config.period_length as Time,
                 *dep_event_id,
-                vehicle_capacity,
+                default_vehicle_capacity,
             );
             let dep_event = events
                 .iter()
@@ -305,7 +359,7 @@ pub fn unroll_timetable(
                 .unwrap();
             vehicle.id = VehicleId(id);
             id += 1;
-            offset_vehicle_times(&mut vehicle, (roll * config.period_length) as u32);
+            offset_vehicle_times(&mut vehicle, (roll * config.period_length) as Time);
 
             let line_info = LineInfo {
                 line_id: dep_event.line_id,
@@ -317,28 +371,194 @@ pub fn unroll_timetable(
             line_infos.push(line_info);
         }
     }
+    let dynamic_profile = dynamic_profile_args
+        .as_ref()
+        .map(|it| parse_dynamic_profile(File::open(it.dp_path.clone()).unwrap()).unwrap());
 
-    let day_duration = (rolls * config.period_length) as u32;
+    let get_customer_share = |time: Time| {
+        if dynamic_profile.is_none() {
+            return 1.0;
+        }
+        let args = dynamic_profile_args.as_ref().unwrap();
+        let dynamic_profile = dynamic_profile.as_ref().unwrap();
+        let time_in_h = time as f64 / dynamic_profile_args.as_ref().unwrap().time_units_per_hour
+            + args.dp_shift;
+        dynamic_profile
+            .iter()
+            .find(|entry| (entry.time + 1) as f64 > time_in_h)
+            .map(|entry| entry.demand_share)
+            .unwrap_or(0.0)
+    };
+
+    let day_duration = ((rolls - 2 * rolls_without_demand) * config.period_length) as Time;
     let commodity_rolls = day_duration / commodity_generation_interval;
-    let commodities = demands
+    let time_offset = (rolls_without_demand * config.period_length) as Time;
+    let mut commodities = demands
         .iter()
         .cartesian_product(0..commodity_rolls)
         .map(|(demand, roll_index)| {
             let origin = ExtStationId(demand.origin as u32);
             let destination = ExtStationId(demand.destination as u32);
-            let customers = demand.customers / (commodity_rolls as f64);
-            let departure = roll_index * commodity_generation_interval;
+            let time = time_offset + roll_index * commodity_generation_interval;
+            let customers = demand.customers * get_customer_share(time);
             ExtCommodity {
-                od_pair: crate::graph::ExtODPair {
+                od_pair: ExtODPair {
                     origin,
-                    departure,
                     destination,
                 },
                 demand: customers,
                 outside_option,
+                cost: if departure_time_choice {
+                    ExtCostCharacteristic::DepartureTimeChoice(ExtDepartureTimeChoice {
+                        target_arrival_time: time,
+                        delay_penalty_factor: 3,
+                    })
+                } else {
+                    ExtCostCharacteristic::FixedDeparture(ExtFixedDeparture {
+                        departure_time: time,
+                    })
+                },
             }
         })
-        .collect();
+        .collect_vec();
+
+    let new_demand = commodities.iter().map(|it| it.demand).sum::<FVal>();
+    let original_demand = demands.iter().map(|it| it.customers).sum::<FVal>();
+    let scale_factor = original_demand / new_demand;
+    for commodity in &mut commodities {
+        commodity.demand *= scale_factor;
+    }
 
     (vehicles, LineInfoMap(line_infos), commodities)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::timpass::{
+        Activity, ActivityType, Config, Demand, Event, EventType, LineDirection, TimetableEntry,
+        parse_demands, parse_timetable,
+    };
+
+    use super::{parse_activities, parse_config, parse_events};
+
+    #[test]
+    fn test_parse_events() {
+        let content = r#"# event_id; type; stop_id; line_id; line_direction; line_freq_repetition
+1; "departure"; 67; 1; >; 1
+2; "arrival"; 53; 1; >; 1"#;
+
+        let events = parse_events(content.as_bytes()).unwrap();
+        assert_eq!(
+            *events,
+            [
+                Event {
+                    event_id: 1,
+                    event_type: EventType::Departure,
+                    stop_id: 67,
+                    line_id: 1,
+                    line_direction: LineDirection::Forward,
+                    line_freq_repetition: 1
+                },
+                Event {
+                    event_id: 2,
+                    event_type: EventType::Arrival,
+                    stop_id: 53,
+                    line_id: 1,
+                    line_direction: LineDirection::Forward,
+                    line_freq_repetition: 1
+                }
+            ]
+        )
+    }
+
+    #[test]
+    fn test_parse_activities() {
+        let content = r#"# activity_index; type; from_event; to_event; lower_bound; upper_bound
+        1; "drive"; 1; 2; 4; 4
+        2; "wait"; 2; 3; 0; 0"#;
+        let activities = parse_activities(content.as_bytes()).unwrap();
+        assert_eq!(
+            *activities,
+            [
+                Activity {
+                    activity_index: 1,
+                    activity_type: ActivityType::Drive,
+                    from_event: 1,
+                    to_event: 2,
+                    lower_bound: 4,
+                    upper_bound: 4
+                },
+                Activity {
+                    activity_index: 2,
+                    activity_type: ActivityType::Wait,
+                    from_event: 2,
+                    to_event: 3,
+                    lower_bound: 0,
+                    upper_bound: 0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_demands() {
+        let content = r#"# origin; destination; customers
+1; 14; 730
+1; 30; 733"#;
+        let demands = parse_demands(content.as_bytes()).unwrap();
+        assert_eq!(
+            *demands,
+            [
+                Demand {
+                    origin: 1,
+                    destination: 14,
+                    customers: 730.0
+                },
+                Demand {
+                    origin: 1,
+                    destination: 30,
+                    customers: 733.0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_timetable() {
+        let content = r#"# event_id; time
+1; 0
+2; 4"#;
+        let timetable = parse_timetable(content.as_bytes()).unwrap();
+        assert_eq!(
+            *timetable,
+            [
+                TimetableEntry {
+                    event_id: 1,
+                    time: 0
+                },
+                TimetableEntry {
+                    event_id: 2,
+                    time: 4
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_config() {
+        let content = r#"# config_key; value
+ptn_name; "S-Bahn Hamburg"
+period_length; 10
+ean_change_penalty; 5
+"#;
+        let config = parse_config(content.as_bytes());
+        assert_eq!(
+            *config.unwrap(),
+            Config {
+                ptn_name: "\"S-Bahn Hamburg\"".into(),
+                period_length: 10,
+                ean_change_penalty: 5
+            }
+        );
+    }
 }

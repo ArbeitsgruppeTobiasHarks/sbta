@@ -1,14 +1,19 @@
 use std::collections::VecDeque;
 
+use log::trace;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
-    col::{set_new, HashSet},
+    col::{HashSet, set_new},
     graph::EdgeIdx,
-    paths_index::PathId,
+    path_index::PathId,
     relation::Relation,
 };
 
+/// A queue that contains all paths that need to be checked again.
+/// It also contains, for every "blocking" boarding edge, the set of
+/// paths for which a better alternative might become available if the
+/// edge is unblocked.
 pub struct PathsQueue {
     // All (unique) path ids in the queue.
     queue_vec: VecDeque<PathId>,
@@ -18,6 +23,8 @@ pub struct PathsQueue {
     // A relation R on ExP where (e, p) is in R iff e might unblock p.
     // No already queued path should be in this relation.
     path_unblocking_edge_relation: Relation<EdgeIdx, PathId>,
+
+    locked_paths: HashSet<PathId>,
 }
 
 impl PathsQueue {
@@ -28,6 +35,11 @@ impl PathsQueue {
     /// Enqueues a path when any of the edges is unblocked.
     /// All these edges must be blocked when calling this method.
     pub fn enqueue_on_unblock(&mut self, path_id: PathId, unblocking_edges: HashSet<EdgeIdx>) {
+        debug_assert!(!self.queue_set.contains(&path_id));
+        trace!(
+            "Enqueuing path {:?} on unblock {:?}",
+            path_id, unblocking_edges
+        );
         self.path_unblocking_edge_relation
             .set_k2_values(path_id, unblocking_edges);
     }
@@ -35,9 +47,10 @@ impl PathsQueue {
     pub fn unblock(&mut self, edge_idx: EdgeIdx) {
         let paths = self.path_unblocking_edge_relation.remove_k1(&edge_idx);
         for path_id in paths {
-            if self.queue_set.insert(path_id) {
-                self.queue_vec.push_front(path_id);
-            }
+            self.path_unblocking_edge_relation.remove_k2(&path_id);
+            debug_assert!(!self.queue_set.contains(&path_id));
+            self.queue_set.insert(path_id);
+            self.queue_vec.push_front(path_id);
         }
     }
 
@@ -78,6 +91,26 @@ impl PathsQueue {
             queue_vec: VecDeque::new(),
             queue_set: set_new(),
             path_unblocking_edge_relation: Relation::new(),
+            locked_paths: set_new(),
         }
+    }
+
+    /// Removes all items from the queue but keeps the unblocking relation untouched.
+    pub fn clear_queue(&mut self) {
+        debug_assert_eq!(self.queue_set.len(), self.queue_vec.len());
+        self.queue_set.clear();
+        self.queue_vec.clear();
+    }
+
+    pub fn lock_path(&mut self, non_eq_path: PathId) {
+        self.locked_paths.insert(non_eq_path);
+    }
+
+    pub fn is_locked(&self, path_id: PathId) -> bool {
+        self.locked_paths.contains(&path_id)
+    }
+
+    pub fn release_locks(&mut self) {
+        self.locked_paths.clear();
     }
 }

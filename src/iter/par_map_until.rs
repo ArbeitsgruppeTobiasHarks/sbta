@@ -50,11 +50,7 @@ fn par_map_until<S: Send, T: Send, U: Send>(
         .try_for_each_with(sender, |sender, (idx, op)| {
             let should_err = matches!(op, ParMapResult::Found(_));
             sender.send((idx, op)).unwrap();
-            if should_err {
-                Err(idx)
-            } else {
-                Ok(())
-            }
+            if should_err { Err(idx) } else { Ok(()) }
         });
 
     ParMapUntilIterator {
@@ -109,5 +105,72 @@ impl<T, U> ParMapUntilIterator<T, U> {
             f(item);
         }
         self.next_idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn test_par_map_until() {
+        use super::*;
+        let mut vec = vec![];
+        let count = (0..100)
+            .par_map_until(|i| {
+                thread::sleep(Duration::from_millis(100 - i));
+                println!("Thread {}: {}", rayon::current_thread_index().unwrap(), i);
+                if i == 50 {
+                    ParMapResult::Found(i)
+                } else {
+                    ParMapResult::NotFound(i)
+                }
+            })
+            .for_each_count(|it| {
+                vec.push(it);
+            });
+
+        assert_eq!(count, 51);
+        let expected_vec = (0..51)
+            .map(|i| {
+                if i == 50 {
+                    ParMapResult::Found(i)
+                } else {
+                    ParMapResult::NotFound(i)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vec, expected_vec);
+    }
+
+    #[test]
+    fn test_use_first_from_original_order() {
+        use super::*;
+        let vec: Vec<ParMapResult<usize, usize>> = (0..2)
+            .par_map_until(|i| {
+                if i == 0 {
+                    thread::sleep(Duration::from_millis(10));
+                    println!("Thread {}: {}", rayon::current_thread_index().unwrap(), i);
+                    ParMapResult::Found(i)
+                } else {
+                    println!("Thread {}: {}", rayon::current_thread_index().unwrap(), i);
+                    ParMapResult::Found(i)
+                }
+            })
+            .collect();
+        assert_eq!(vec, vec![ParMapResult::Found(0)]);
+    }
+
+    #[test]
+    fn test_pass_all_items_if_none_was_found() {
+        use super::*;
+        let vec: Vec<ParMapResult<usize, usize>> =
+            (0..100).par_map_until(ParMapResult::NotFound).collect();
+        assert_eq!(
+            vec,
+            (0_usize..100_usize)
+                .map(ParMapResult::NotFound)
+                .collect_vec()
+        );
     }
 }

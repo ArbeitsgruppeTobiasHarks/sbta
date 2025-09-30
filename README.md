@@ -5,10 +5,7 @@ This document describes how to run the heuristic for computing side-constrained 
 ## Getting Started
 
 These instructions assume GNU/Linux as operating system.
-If compiled under Windows, the Rust binary also works on Windows; however, the steps of the included shell script `experiment.sh` (see next section) need to be executed manually.
-Please make sure to have the following tools installed:
-* sqlite3, for accessing the generated sqlite files
-* jq, for accessing JSON files
+If compiled under Windows, the Rust binary should also work on Windows; however, the steps of the included shell script `experiment.sh` (see next section) need to be executed manually.
 
 To get started, please install the Rust toolchain by installing [rustup](https://www.rust-lang.org/tools/install).
 As our source code uses some experimental features of Rust, please use the nightly distribution of the Rust toolchain by running:
@@ -16,14 +13,31 @@ As our source code uses some experimental features of Rust, please use the night
 rustup default nightly
 ```
 
-To download all dependencies and to compile the program, please run:
+This project depends on the Gurobi solver in version 11.
+To be able to compile the project, please first download the Gurobi API,
+make sure to have a valid Gurobi license located in your home directory,
+and add the environment variables
+```sh
+export GUROBI_HOME=/path/to/gurobi1100/linux64/
+export LD_LIBRARY_PATH=/path/to/gurobi1100/linux64/lib
+```
+
+Furthermore, the project depends on `sqlite3`. Please make sure that this binary is available, e.g., on Ubuntu by running `sudo apt install sqlite3`.
+
+To download all other dependencies and to compile the program, please run:
 ```sh
 cargo run -r
 ```
 This should also print usage instructions for the compiled binary.
 
+Finally, make the shell scripts executable:
+```sh
+chmod +x all-experiments.sh experiment.sh
+```
+
 
 ## Running the experiments
 
-To conduct the experiment for a specific network, please run `./experiment.sh exp-XYZ.json` where you may choose `XYZ` from `hamburg` and `swiss`.
-After an equilibrium is computed for every demand factor, the results will be collected and written to `./data/XYZ/collated.json`.
+To conduct the experiment for a specific network, please run `./experiment.sh exp-XYZ.json`.
+
+To conduct the experiment for all networks sequentially, please run `./experiment_all.sh`.

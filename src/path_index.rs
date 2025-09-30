@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use crate::col::{map_new, HashMap};
+use crate::col::{HashMap, map_new};
 use crate::graph::{Path, PathBox};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,7 +31,7 @@ impl<'a> PathsIndex<'a> {
         self.paths[path_id.0 as usize].payload()
     }
 
-    pub fn path_ids(&self) -> impl Iterator<Item = PathId> {
+    pub fn path_ids(&self) -> impl Iterator<Item = PathId> + use<> {
         (0..self.paths.len()).map(|id| PathId(id as u32))
     }
 

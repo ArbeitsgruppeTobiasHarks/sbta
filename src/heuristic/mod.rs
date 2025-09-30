@@ -1,95 +1,109 @@
 mod fill_indestructible;
 mod fill_optimal;
-mod paths_queue;
+pub mod multi_phase_strategy;
+pub mod paths_queue;
+pub mod paths_queue_strategy;
+pub mod term_cond;
 
-use std::mem::swap;
+use std::path::Path;
 
 use crate::{
-    graph::{CommodityIdx, CommodityPayload, Path, EPS_L},
-    heuristic::{
-        fill_indestructible::fill_indestructible_paths, fill_optimal::fill_all_optimal_paths,
-        paths_queue::PathsQueue,
-    },
-    iter::par_map_until::{ParMapResult, ParMapUntil},
+    graph::CommodityIdx,
+    heuristic::fill_indestructible::fill_indestructible_paths,
+    primitives::{EPS, EPS_L, FVal, Time},
+    regret::{self, get_max_relative_regret, get_num_regretting_paths, get_regretting_demand},
+    serialization::flow::{export_flow, import_flow},
+    shortest_path::best_paths::edge_is_not_a_boarding_edge_of_a_full_driving_edge,
+    timer::Timer,
 };
-use log::{debug, error, info, warn};
-use rayon::prelude::*;
+use fill_optimal::fill_using_system_optimum;
+use log::{debug, error, info, trace, warn};
+use rayon::{iter::IndexedParallelIterator, prelude::*};
+use sqlite::{OpenFlags, State};
+use term_cond::TerminationCondition;
 
 use crate::{
-    a_star::{compute_a_star_table, AStarTable},
-    best_paths::{find_best_response_path_with_derivative_astar, find_better_path},
-    col::{set_new, HashSet},
+    col::{HashSet, set_new},
     flow::{CycleAwareFlow, Flow},
-    graph::{
-        DescribePath, DriveNavigate, EdgeIdx, EdgePayload, EdgeType, FVal, Graph, PathBox, Time,
-        EPS,
-    },
-    paths_index::{PathId, PathsIndex},
+    graph::{DescribePath, DriveNavigate, EdgeIdx, EdgeType, Graph, PathBox},
+    path_index::{PathId, PathsIndex},
+    shortest_path::a_star::{AStarTable, compute_a_star_table},
+    shortest_path::best_paths::{find_best_response_path_with_derivative_astar, find_better_path},
 };
 
 #[derive(Debug)]
-pub struct Stats {
+pub struct HeuristicStats {
     pub demand_prerouted: FVal,
     pub num_boarding_edges_blocked_by_prerouting: usize,
     pub num_commodities_fully_prerouted: usize,
     pub num_iterations: usize,
+    pub num_iterations_postprocessing: usize,
     pub initial_len_paths_queue: usize,
+}
+
+#[derive(Debug)]
+pub struct FlowStats {
+    pub total_regret: f64,
+    pub mean_relative_regret: f64,
+    pub max_relative_regret: f64,
+    pub num_regretting_paths: usize,
+    pub regretting_demand: f64,
     /// The social cost of the computed flow: $ \sum_p f_p \cdot c_p $
     pub cost: f64,
     /// The total demand routed on their outside option.
     pub demand_outside: f64,
-    /// The computation time for the heuristic
-    pub computation_time: std::time::Duration,
 }
 
-pub fn eq_heuristic<'a>(
-    graph: &Graph,
-    initial_solution: Option<(Flow, PathsIndex<'a>)>,
-    log_iteration_count: usize,
-) -> (Flow, PathsIndex<'a>, Stats) {
-    let time_started = std::time::Instant::now();
-
-    let mut a_star_table: AStarTable = AStarTable::new(graph.num_stations(), graph.num_nodes());
-
-    let (mut flow, mut paths) = initial_solution.unwrap_or_else(|| {
-        let mut paths = PathsIndex::new();
-        let mut flow = Flow::new();
-
-        // We assume that each commodity already has its own SPAWN node and outside option edge.
-        info!("Filling initial solution with outside options...");
-        for (commodity_id, commodity) in graph.commodities() {
-            let path_id = paths.transfer_path(graph.outside_path(commodity_id));
-            flow.add_flow_onto_path(&paths, path_id, commodity.demand, true, true);
+impl Default for FlowStats {
+    fn default() -> Self {
+        FlowStats {
+            total_regret: 0.0,
+            mean_relative_regret: 0.0,
+            max_relative_regret: 0.0,
+            num_regretting_paths: 0,
+            regretting_demand: 0.0,
+            cost: 0.0,
+            demand_outside: 0.0,
         }
+    }
+}
 
-        fill_indestructible_paths(graph, &mut paths, &mut a_star_table, &mut flow);
+impl FlowStats {
+    pub fn compute(
+        graph: &Graph,
+        flow: &Flow,
+        a_star_table: &AStarTable,
+        paths: &PathsIndex,
+    ) -> FlowStats {
+        FlowStats {
+            total_regret: regret::get_total_regret(graph, flow, a_star_table, paths),
+            mean_relative_regret: regret::get_mean_relative_regret(
+                graph,
+                flow,
+                a_star_table,
+                paths,
+            ),
+            max_relative_regret: get_max_relative_regret(graph, flow, a_star_table, paths),
+            num_regretting_paths: get_num_regretting_paths(graph, flow, a_star_table, paths),
+            regretting_demand: get_regretting_demand(graph, flow, a_star_table, paths),
+            cost: flow.cost(paths, graph),
+            demand_outside: flow.get_demand_outside(paths),
+        }
+    }
+}
 
-        (flow, paths)
-    });
+#[derive(Debug)]
+pub struct Stats {
+    /// The computation time for the heuristic
+    pub computation_time: std::time::Duration,
 
-    // Collect stats:
-    // (1) How much demand could be routed on indestructible paths?
-    // (2) How many boarding edges are blocked now?
-    // (3) How many commodities were completely prerouted?
-    let mut stats = Stats {
-        demand_prerouted: 0.0,
-        num_boarding_edges_blocked_by_prerouting: 0,
-        num_commodities_fully_prerouted: 0,
-        num_iterations: 0,
-        computation_time: std::time::Duration::new(0, 0),
-        cost: 0.0,
-        demand_outside: 0.0,
-        initial_len_paths_queue: 0,
-    };
+    pub heuristic: Option<HeuristicStats>,
 
-    stats.demand_prerouted = flow
-        .path_flow_map()
-        .iter()
-        .filter(|&(&path_id, _)| !paths.path(path_id).is_outside())
-        .map(|(_, &flow_val)| flow_val)
-        .sum();
+    pub flow: FlowStats,
+}
 
-    stats.num_boarding_edges_blocked_by_prerouting = graph
+fn get_num_blocked_boarding_edges(graph: &Graph, flow: &Flow) -> usize {
+    graph
         .edges()
         .filter(|&(_, edge)| matches!(edge.edge_type, EdgeType::Board(_)))
         .filter(|&(_, edge)| {
@@ -106,181 +120,413 @@ pub fn eq_heuristic<'a>(
             let slack = capacity - drive_edge_flow;
             slack <= EPS_L
         })
-        .count();
+        .count()
+}
 
-    stats.num_commodities_fully_prerouted = graph
+fn get_num_commodities_not_using_outside_option(
+    graph: &Graph,
+    flow: &Flow,
+    paths: &mut PathsIndex,
+) -> usize {
+    graph
         .commodities()
         .filter(|&(commodity_id, _)| {
             let outside_path = graph.outside_path(commodity_id);
             let outside_path_flow = flow.on_path(paths.transfer_path(outside_path));
             outside_path_flow <= EPS_L
         })
-        .count();
+        .count()
+}
+
+pub trait StrategyBuilder {
+    type S: Strategy + TerminationCondition;
+
+    fn create(
+        self: Self,
+        graph: &Graph,
+        flow: &Flow,
+        paths: &mut PathsIndex,
+        a_star_table: &AStarTable,
+        h_stats: &mut HeuristicStats,
+        timer: &mut Timer,
+    ) -> Self::S;
+}
+
+pub trait Strategy {
+    fn info(&self) -> String;
+
+    fn on_iterate(
+        &mut self,
+        graph: &Graph,
+        flow: &Flow,
+        a_star_table: &AStarTable,
+        paths: &mut PathsIndex,
+        h_stats: &HeuristicStats,
+        timer: &mut Timer,
+    );
+
+    fn get_non_eq_witness(
+        &mut self,
+        graph: &Graph,
+        flow: &Flow,
+        a_star_table: &AStarTable,
+        paths: &PathsIndex,
+    ) -> Option<(PathId, PathBox)>;
+
+    fn on_add_to_flow(&mut self, graph: &Graph, flow: &Flow, direction: &Flow, paths: &PathsIndex);
+
+    fn on_flow_added(&mut self, graph: &Graph, updated_flow: &Flow, direction: &Flow);
+
+    fn found_infinite_cycle(&mut self, non_eq_path: PathId);
+
+    fn into_flow(
+        self,
+        flow: Flow,
+        graph: &Graph,
+        a_star_table: &AStarTable,
+        paths: &PathsIndex,
+    ) -> Flow;
+}
+
+pub fn initialize<'a>(graph: &Graph) -> (Flow, PathsIndex<'a>, AStarTable, Stats, Vec<EdgeIdx>) {
+    let time_started = std::time::Instant::now();
+    let mut paths = PathsIndex::new();
+    let mut flow = Flow::new();
+
+    let mut a_star_table: AStarTable = AStarTable::new(graph.num_stations(), graph.num_nodes());
+
+    // We assume that each commodity already has its own SPAWN node and outside option edge.
+    info!("Filling initial solution with outside options...");
+    for (commodity_id, commodity) in graph.commodities() {
+        let path_id = paths.transfer_path(graph.outside_path(commodity_id));
+        flow.add_flow_onto_path(&paths, path_id, commodity.demand, true, true);
+    }
+
+    fill_indestructible_paths(graph, &mut paths, &mut a_star_table, &mut flow);
+
+    // Collect stats:
+    // (1) How much demand could be routed on indestructible paths?
+    // (2) How many boarding edges are blocked now?
+    // (3) How many commodities were completely prerouted?
+
+    let mut h_stats = HeuristicStats {
+        demand_prerouted: 0.0,
+        num_boarding_edges_blocked_by_prerouting: 0,
+        num_commodities_fully_prerouted: 0,
+        num_iterations: 0,
+        num_iterations_postprocessing: 0,
+        initial_len_paths_queue: 0,
+    };
+
+    h_stats.demand_prerouted = flow.get_demand_inside(&paths);
+    h_stats.num_boarding_edges_blocked_by_prerouting = get_num_blocked_boarding_edges(graph, &flow);
+    h_stats.num_commodities_fully_prerouted =
+        get_num_commodities_not_using_outside_option(graph, &flow, &mut paths);
+
+    let forbidden_boarding_edges = graph
+        .edges()
+        .filter(|(_, edge)| !edge_is_not_a_boarding_edge_of_a_full_driving_edge(edge, &flow, graph))
+        .map(|(edge_idx, _)| edge_idx)
+        .collect::<Vec<_>>();
 
     info!("Computing A*-Table...");
-    compute_a_star_table(&mut a_star_table, graph, |_, edge| {
-        if !matches!(edge.edge_type, EdgeType::Board(_)) {
-            return true;
-        }
-        let drive_edge = graph.node(edge.to).outgoing[0];
-        let drive_edge_flow = flow.on_edge(drive_edge);
+    let forbidden_edges = forbidden_boarding_edges
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    compute_a_star_table(&mut a_star_table, graph, |edge_idx, _| {
+        !forbidden_edges.contains(&edge_idx)
+    });
+    fill_using_system_optimum(
+        &mut flow,
+        graph,
+        &a_star_table,
+        &forbidden_edges,
+        &mut paths,
+    );
 
-        let capacity = {
-            let drive_edge = graph.edge(drive_edge);
-            if let EdgeType::Drive(capacity) = drive_edge.edge_type {
-                capacity
-            } else {
-                panic!("Drive edge is not a drive edge!");
-            }
-        };
-        let slack = capacity - drive_edge_flow;
-        slack > EPS_L
+    trace!("Computing stats...");
+    let stats = Stats {
+        computation_time: time_started.elapsed(),
+        heuristic: Some(h_stats),
+        flow: FlowStats::compute(graph, &flow, &a_star_table, &paths),
+    };
+    info!("{:#?}", stats);
+
+    (flow, paths, a_star_table, stats, forbidden_boarding_edges)
+}
+
+pub fn serialize_initial(
+    graph: &Graph,
+    (flow, paths, a_star_table, stats, forbidden_boarding_edges): (
+        &Flow,
+        &PathsIndex<'_>,
+        &AStarTable,
+        &Stats,
+        &Vec<EdgeIdx>,
+    ),
+    path: &str,
+) {
+    export_flow(
+        graph,
+        Some(stats),
+        flow,
+        paths,
+        &regret::get_regret_map(graph, flow, paths, a_star_table),
+        path,
+    );
+    let connection = sqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::default()
+            .with_create()
+            .with_no_mutex()
+            .with_read_write(),
+    )
+    .unwrap();
+    connection.execute("BEGIN TRANSACTION;").unwrap();
+
+    connection
+        .execute(
+            "CREATE TABLE forbidden_edges (
+            edge_id INTEGER NOT NULL
+        )",
+        )
+        .unwrap();
+
+    let mut stmt = connection
+        .prepare("INSERT INTO forbidden_edges (edge_id) VALUES (?)")
+        .unwrap();
+    for id in forbidden_boarding_edges {
+        stmt.bind((1, id.0 as i64)).unwrap();
+        stmt.next().unwrap();
+        stmt.reset().unwrap();
+    }
+
+    connection.execute("END TRANSACTION;").unwrap();
+}
+
+fn deserialize_initial<'a>(graph: &Graph, path: &str) -> (Flow, PathsIndex<'a>, AStarTable, Stats) {
+    let (flow, paths) = import_flow(graph, None, path).unwrap();
+
+    let connection =
+        sqlite::Connection::open_with_flags(path, OpenFlags::default().with_read_only()).unwrap();
+
+    let mut stmt = connection
+        .prepare("SELECT edge_id FROM forbidden_edges")
+        .unwrap();
+    let mut forbidden_boarding_edges = set_new();
+    while let sqlite::State::Row = stmt.next().unwrap() {
+        let edge_idx: i64 = stmt.read(0).unwrap();
+        forbidden_boarding_edges.insert(EdgeIdx(edge_idx as u32));
+    }
+
+    info!("Computing A*-Table...");
+    let mut a_star_table: AStarTable = AStarTable::new(graph.num_stations(), graph.num_nodes());
+    compute_a_star_table(&mut a_star_table, graph, |edge_idx, _| {
+        !forbidden_boarding_edges.contains(&edge_idx)
     });
 
-    fill_all_optimal_paths(&mut flow, graph, &a_star_table, &mut paths);
-
-    let mut paths_queue = {
-        let mut q = PathsQueue::new();
-        for &path_id in flow.path_flow_map().keys() {
-            q.enqueue_front(path_id);
-        }
-        purge_paths_queue(graph, &a_star_table, &mut paths, &flow, &mut q);
-        stats.initial_len_paths_queue = q.len();
-        q
+    let mut h_stats = HeuristicStats {
+        demand_prerouted: 0.0,
+        num_boarding_edges_blocked_by_prerouting: 0,
+        num_commodities_fully_prerouted: 0,
+        num_iterations: 0,
+        num_iterations_postprocessing: 0,
+        initial_len_paths_queue: 0,
     };
+
+    let mut stmt = connection
+        .prepare("SELECT COMPUTATION_TIME_MS, DEMAND_PREROUTED, NUM_BOARDING_EDGES_BLOCKED_BY_PREROUTING, NUM_COMMODITIES_FULLY_PREROUTED FROM flow_stats")
+        .unwrap();
+    assert_eq!(stmt.next().unwrap(), State::Row);
+    let computation_time = std::time::Duration::from_millis(stmt.read::<i64, _>(0).unwrap() as u64);
+    h_stats.demand_prerouted = stmt.read(1).unwrap();
+    h_stats.num_boarding_edges_blocked_by_prerouting = stmt.read::<i64, _>(2).unwrap() as usize;
+    h_stats.num_commodities_fully_prerouted = stmt.read::<i64, _>(3).unwrap() as usize;
+
+    (
+        flow,
+        paths,
+        a_star_table,
+        Stats {
+            computation_time,
+            heuristic: Some(h_stats),
+            flow: FlowStats::default(),
+        },
+    )
+}
+
+pub fn eq_heuristic_main_loop<'a>(
+    graph: &Graph,
+    (flow, mut paths, a_star_table, stats): (Flow, PathsIndex<'a>, AStarTable, Stats),
+    log_iteration_count: usize,
+    strategy_builder: impl StrategyBuilder,
+) -> (Flow, PathsIndex<'a>, Stats, AStarTable) {
+    let mut timer = Timer::new();
+    timer.add(stats.computation_time);
+    timer.start();
+    let mut h_stats = stats.heuristic.unwrap();
+
+    let mut strategy = strategy_builder.create(
+        graph,
+        &flow,
+        &mut paths,
+        &a_star_table,
+        &mut h_stats,
+        &mut timer,
+    );
 
     let mut ca_flow = CycleAwareFlow::new(Some(flow));
 
-    let mut iteration = 0;
-    loop {
-        let should_log = iteration % log_iteration_count == 0;
+    while strategy.advance(h_stats.num_iterations, &mut timer) {
+        strategy.on_iterate(
+            graph,
+            ca_flow.flow(),
+            &a_star_table,
+            &mut paths,
+            &h_stats,
+            &mut timer,
+        );
+
+        let should_log = h_stats.num_iterations % log_iteration_count == 0;
         if should_log {
-            info!("Iteration {:}, |q|={:}", iteration, paths_queue.len());
+            info!(
+                "Iteration {:}, {:}",
+                h_stats.num_iterations,
+                strategy.info()
+            );
         }
-        let result = eq_heuristic_step(
+
+        let reached_eq = eq_heuristic_step(
             graph,
             &a_star_table,
             &mut paths,
             &mut ca_flow,
-            &mut paths_queue,
+            &mut strategy,
             should_log,
         );
 
-        if result {
+        h_stats.num_iterations += 1;
+        if reached_eq {
+            info!("REACHED EQUILIBRIUM");
             break;
         }
-        iteration += 1;
     }
+    info!(
+        "Main loop terminated after {:} iterations",
+        h_stats.num_iterations
+    );
 
-    info!("REACHED EQUILIBRIUM");
+    let flow = strategy.into_flow(ca_flow.drain(), graph, &a_star_table, &paths);
 
-    let time_finished = std::time::Instant::now();
-
-    debug!("Computing stats...");
-    stats.num_iterations = iteration;
-    stats.cost = ca_flow.flow().cost(&paths, graph);
-    stats.computation_time = time_finished - time_started;
-    stats.demand_outside = ca_flow
-        .flow()
-        .path_flow_map()
-        .iter()
-        .filter(|it| paths.path(*it.0).is_outside())
-        .map(|it| it.1)
-        .sum();
-
+    info!("Computing stats...");
+    let stats = Stats {
+        computation_time: timer.elapsed(),
+        heuristic: Some(h_stats),
+        flow: FlowStats::compute(graph, &flow, &a_star_table, &paths),
+    };
     info!("{:#?}", stats);
 
-    (ca_flow.drain(), paths, stats)
+    (flow, paths, stats, a_star_table)
 }
 
-pub fn arrival_of_path(path: &Path, graph: &Graph, commodity: &CommodityPayload) -> Time {
-    match path.edges().last() {
-        None => commodity.outside_latest_arrival,
-        Some(&edge_idx) => {
-            let edge: &EdgePayload = graph.edge(edge_idx);
-            let to_node = graph.node(edge.to);
-            to_node.time
-        }
-    }
-}
-
-fn get_non_eq_witness_with_paths_queue(
+pub fn eq_heuristic_with_buffer_initial<'a>(
     graph: &Graph,
-    a_star_table: &AStarTable,
-    paths: &mut PathsIndex,
+    log_iteration_count: usize,
+    strategy_builder: impl StrategyBuilder,
+    initial_solution_path: &str,
+) -> (Flow, PathsIndex<'a>, Stats, AStarTable) {
+    if Path::exists(Path::new(initial_solution_path)) {
+        info!("Loading initial solution from file...");
+        let (flow, paths, a_star_table, stats) = deserialize_initial(graph, initial_solution_path);
+        info!("Initial solution loaded.");
+        return eq_heuristic_main_loop(
+            graph,
+            (flow, paths, a_star_table, stats),
+            log_iteration_count,
+            strategy_builder,
+        );
+    }
+    info!("No initial solution found. Starting from scratch...");
+    let (flow, paths, a_star_table, stats, forbidden_boarding_edges) = initialize(graph);
+    info!("Serializing initial solution...");
+    serialize_initial(
+        graph,
+        (
+            &flow,
+            &paths,
+            &a_star_table,
+            &stats,
+            &forbidden_boarding_edges,
+        ),
+        initial_solution_path,
+    );
+    info!("Initial solution serialized. Starting heuristic...");
+    eq_heuristic_main_loop(
+        graph,
+        (flow, paths, a_star_table, stats),
+        log_iteration_count,
+        strategy_builder,
+    )
+}
+
+pub fn eq_heuristic<'a>(
+    graph: &Graph,
+    log_iteration_count: usize,
+    strategy_builder: impl StrategyBuilder,
+) -> (Flow, PathsIndex<'a>, Stats, AStarTable) {
+    let (flow, paths, a_star_table, stats, _) = initialize(graph);
+    eq_heuristic_main_loop(
+        graph,
+        (flow, paths, a_star_table, stats),
+        log_iteration_count,
+        strategy_builder,
+    )
+}
+
+fn get_non_eq_witness_round_robin(
+    round_robin_idx: &mut usize,
     flow: &Flow,
-    paths_queue: &mut PathsQueue,
+    a_star_table: &AStarTable,
+    graph: &Graph,
+    paths: &PathsIndex,
 ) -> Option<(PathId, PathBox)> {
-    struct BetterResponse(PathId, PathBox);
-    enum NotFound {
-        NoFlowOnPath,
-        NoBetterResponse(PathId, HashSet<EdgeIdx>),
-    }
-
-    let mut better_response: Option<BetterResponse> = None;
-
-    let count = paths_queue
+    let paths_to_check: Vec<PathId> = flow
+        .path_flow_map()
         .iter()
-        .par_map_until(|&path_id| {
-            if flow.on_path(path_id) <= EPS_L {
-                return ParMapResult::NotFound(NotFound::NoFlowOnPath);
-            }
-            let path = paths.path(path_id);
-            match find_better_path(a_star_table, graph, flow, path) {
-                Err(unblocking_edges) => {
-                    ParMapResult::NotFound(NotFound::NoBetterResponse(path_id, unblocking_edges))
-                }
-                Ok(better_path) => ParMapResult::Found(BetterResponse(path_id, better_path)),
-            }
+        .filter_map(|it| if *it.1 > EPS_L { Some(*it.0) } else { None })
+        .collect();
+    let start_idx = *round_robin_idx % paths_to_check.len();
+    paths_to_check
+        .par_iter()
+        .enumerate()
+        .skip(start_idx)
+        .chain(paths_to_check.par_iter().enumerate().take(start_idx))
+        .find_map_first(|(idx, &path_id)| {
+            find_better_path(a_star_table, graph, flow, paths.path(path_id))
+                .map(|best_response| (idx, path_id, best_response))
         })
-        .for_each_count(|it| match it {
-            ParMapResult::Found(it) => better_response = Some(it),
-            ParMapResult::NotFound(NotFound::NoFlowOnPath) => {}
-            ParMapResult::NotFound(NotFound::NoBetterResponse(path_id, unblocking_edges)) => {
-                paths_queue.enqueue_on_unblock(path_id, unblocking_edges);
-            }
-        });
-    paths_queue.remove_first_n(if better_response.is_some() {
-        count - 1
-    } else {
-        count
-    });
-
-    better_response.map(|it| (it.0, it.1))
+        .map(|(idx, path, best_response)| {
+            *round_robin_idx = idx % paths_to_check.len();
+            (path, best_response)
+        })
 }
 
-fn purge_paths_queue(
-    graph: &Graph,
-    a_star_table: &AStarTable,
-    paths: &mut PathsIndex,
+fn get_non_eq_withness_from_beginning(
     flow: &Flow,
-    paths_queue: &mut PathsQueue,
-) {
-    info!("Purgin paths queue...");
-    let reenqueue = paths_queue
+    graph: &Graph,
+    paths: &PathsIndex,
+    a_star_table: &AStarTable,
+) -> Option<(PathId, PathBox)> {
+    flow.path_flow_map()
         .par_iter()
-        .filter_map(|&path_id| {
-            if flow.on_path(path_id) <= EPS_L {
+        .find_map_first(|(&path_id, &flow_val)| {
+            if flow_val <= EPS_L {
                 return None;
             }
-            let path = paths.path(path_id);
-            Some(match find_better_path(a_star_table, graph, flow, path) {
-                Ok(_) => (path_id, None),
-                Err(unblocking_edges) => (path_id, Some(unblocking_edges)),
-            })
+            find_better_path(a_star_table, graph, flow, paths.path(path_id))
+                .map(|best_response| (path_id, best_response))
         })
-        .collect::<Vec<_>>();
-
-    paths_queue.remove_first_n(paths_queue.len());
-
-    for result in reenqueue {
-        match result {
-            (path_id, None) => paths_queue.enqueue_back(path_id),
-            (path_id, Some(unblocking_edges)) => {
-                paths_queue.enqueue_on_unblock(path_id, unblocking_edges)
-            }
-        }
-    }
 }
 
 /// Returns a feasible direction, if the flow is not at equilibrium, otherwise None.
@@ -289,15 +535,10 @@ fn get_feasible_direction(
     a_star_table: &AStarTable,
     paths: &mut PathsIndex,
     flow: &Flow,
-    paths_queue: &mut PathsQueue,
-) -> Option<Flow> {
-    let non_eq_witness: Option<(PathId, PathBox)> =
-        get_non_eq_witness_with_paths_queue(graph, a_star_table, paths, flow, paths_queue);
-
-    let (non_eq_path, best_response) = match non_eq_witness {
-        Some(paths) => paths,
-        None => return None,
-    };
+    strategy: &mut impl Strategy,
+) -> Option<(Flow, PathId)> {
+    let (non_eq_path, best_response) =
+        strategy.get_non_eq_witness(graph, flow, a_star_table, paths)?;
 
     let mut direction = Flow::new();
     let best_response = paths.transfer_path(best_response);
@@ -319,42 +560,19 @@ fn get_feasible_direction(
 
     assert!(direction.path_flow_map().iter().any(|it| *it.1 > 0.0));
 
-    Some(direction)
+    Some((direction, non_eq_path))
 }
 
 fn add_direction_to_flow(
     ca_flow: &mut CycleAwareFlow,
     direction: Flow,
-    paths_queue: &mut PathsQueue,
+    strategy: &mut impl Strategy,
     graph: &Graph,
     paths: &PathsIndex,
 ) {
-    // Enqueue all paths that were zero before and are positive afterwards.
-    for (&path_id, &path_dir) in direction.path_flow_map() {
-        if path_dir > 0.0 && ca_flow.flow().on_path(path_id) <= EPS_L {
-            paths_queue.enqueue_front(path_id);
-        }
-    }
-
-    ca_flow.add_to_flow(paths, direction, |flow, direction| {
-        // Unblock all edges that are now unblocked.
-        for (&edge_idx, &edge_dir) in direction.edge_flow_map() {
-            if edge_dir < 0.0 {
-                let flow = flow.on_edge(edge_idx);
-                let capacity = {
-                    let edge = graph.edge(edge_idx);
-                    match edge.edge_type {
-                        EdgeType::Drive(capacity) => capacity,
-                        _ => continue,
-                    }
-                };
-                let slack = capacity - flow;
-                if slack > EPS_L {
-                    continue;
-                }
-                paths_queue.unblock(edge_idx);
-            }
-        }
+    strategy.on_add_to_flow(graph, ca_flow.flow(), &direction, paths);
+    ca_flow.add_to_flow(paths, direction, |updated_flow, direction| {
+        strategy.on_flow_added(graph, updated_flow, direction);
     });
 }
 
@@ -364,24 +582,24 @@ fn eq_heuristic_step(
     a_star_table: &AStarTable,
     paths: &mut PathsIndex,
     ca_flow: &mut CycleAwareFlow,
-    paths_queue: &mut PathsQueue,
+    strategy: &mut impl Strategy,
     should_log: bool,
 ) -> bool {
-    let mut direction =
-        match get_feasible_direction(graph, a_star_table, paths, ca_flow.flow(), paths_queue) {
-            None => return true,
-            Some(direction) => direction,
-        };
+    let Some((mut direction, mut non_eq_path)) =
+        get_feasible_direction(graph, a_star_table, paths, ca_flow.flow(), strategy)
+    else {
+        return true;
+    };
     let mut may_increase =
         get_longest_feasible_extension(graph, ca_flow.flow(), &direction, false, true);
 
     if may_increase <= 0.0 {
         warn!("INFEASIBLE DIRECTION. Recomputing edge flow and try again...");
         ca_flow.recompute_edge_flow();
-        direction =
-            match get_feasible_direction(graph, a_star_table, paths, ca_flow.flow(), paths_queue) {
+        (direction, non_eq_path) =
+            match get_feasible_direction(graph, a_star_table, paths, ca_flow.flow(), strategy) {
                 None => return true,
-                Some(direction) => direction,
+                Some(it) => it,
             };
         may_increase =
             get_longest_feasible_extension(graph, ca_flow.flow(), &direction, true, true);
@@ -396,7 +614,7 @@ fn eq_heuristic_step(
 
     direction.scale_by(may_increase);
 
-    add_direction_to_flow(ca_flow, direction, paths_queue, graph, paths);
+    add_direction_to_flow(ca_flow, direction, strategy, graph, paths);
 
     if let Some((cycle_len, cycle_direction)) = ca_flow.has_cycle(paths) {
         // Check if the direction on the cycle is feasible.
@@ -410,9 +628,11 @@ fn eq_heuristic_step(
             );
         } else if may_extend >= f64::INFINITY {
             warn!(
-                "IGNORING INFINITELY FEASIBLE CYCLE OF LENGTH {:}!",
+                "DETECTED INFINITELY FEASIBLE CYCLE OF LENGTH {:}! Changing path selection strategy...",
                 cycle_len
             );
+
+            strategy.found_infinite_cycle(non_eq_path);
         } else {
             debug!(
                 "EXTENDING ALONG CYCLE OF LENGTH {:} WITH EXTENSIBILITY {:}:\n{}",
@@ -423,7 +643,7 @@ fn eq_heuristic_step(
             let mut cycle_direction = cycle_direction;
             cycle_direction.scale_by(may_extend);
 
-            add_direction_to_flow(ca_flow, cycle_direction, paths_queue, graph, paths);
+            add_direction_to_flow(ca_flow, cycle_direction, strategy, graph, paths);
         }
     }
 
@@ -455,8 +675,8 @@ fn move_to_better_paths(
             direction,
             path,
         );
-        let arrival_best_response = arrival_of_path(best_response.payload(), graph, commodity);
-        if arrival_best_response >= arrival_of_path(path, graph, commodity) {
+        let cost_best_response = best_response.payload().cost(commodity, graph);
+        if cost_best_response >= path.cost(commodity, graph) {
             continue;
         }
 
@@ -479,9 +699,9 @@ fn move_to_better_paths(
         while may_add > 0.0 {
             let worst_used_path =
                 get_worst_used_path(graph, paths, flow, direction, path.commodity_idx());
-            assert!(worst_used_path.arrival >= arrival_best_response);
+            assert!(worst_used_path.cost >= cost_best_response);
             // TODO: Check if we should not assert that worst used path is greater than best response.
-            if worst_used_path.arrival == arrival_best_response {
+            if worst_used_path.cost == cost_best_response {
                 break;
             }
             let may_swap = may_add.min(worst_used_path.may_remove);
@@ -499,7 +719,7 @@ fn move_to_better_paths(
 
 struct WorstUsedPath {
     path_id: PathId,
-    arrival: Time,
+    cost: Time,
     may_remove: FVal,
 }
 fn get_worst_used_path(
@@ -516,23 +736,23 @@ fn get_worst_used_path(
         if new_path.commodity_idx() != commodity_idx {
             return;
         }
-        let new_arrival = arrival_of_path(new_path, graph, graph.commodity(commodity_idx));
+        let new_cost = new_path.cost(graph.commodity(commodity_idx), graph);
         match worst_path {
             None => {
                 worst_path = Some(WorstUsedPath {
                     path_id: new_path_id,
-                    arrival: new_arrival,
+                    cost: new_cost,
                     may_remove,
                 })
             }
             Some(WorstUsedPath {
                 path_id: _,
-                arrival,
+                cost: arrival,
                 may_remove: _,
-            }) if new_arrival > arrival => {
+            }) if new_cost > arrival => {
                 worst_path = Some(WorstUsedPath {
                     path_id: new_path_id,
-                    arrival: new_arrival,
+                    cost: new_cost,
                     may_remove,
                 })
             }
@@ -668,9 +888,9 @@ fn reroute_exceeded_drive_edge(
             // This assertion fails, if ...
             // The next drive edge is full, f_e = v, and the direction is positive, d_e > 0.
             // The boarding edge of the next drive edge has no flow and the direction is not positive (=> so it's zero).
-            // => The dwell edge must also be full, and its direction must be positive.
-            // => The previous drive edge must be full, and d_alight + d_dwell = d_prevdrive <= 0.
-            // => d_alight <= -d_dwell < 0.
+            // => The stay-on edge must also be full, and its direction must be positive.
+            // => The previous drive edge must be full, and d_off + d_stay = d_prevdrive <= 0.
+            // => d_off <= -d_stay < 0.
             //... ????
 
             error!("Assertion failed...");
@@ -692,17 +912,17 @@ fn reroute_exceeded_drive_edge(
             error!(
                 " O {:}. f={:}, d={:}",
                 describe_drive_edge(graph, check_drive_edge.id()),
-                flow.on_edge(check_drive_edge.post_alight().id()),
-                direction.on_edge(check_drive_edge.post_alight().id())
+                flow.on_edge(check_drive_edge.post_get_off().id()),
+                direction.on_edge(check_drive_edge.post_get_off().id())
             );
-            let dwell = check_drive_edge.post_dwell().unwrap();
+            let stay_on = check_drive_edge.post_stay_on().unwrap();
             error!(
                 " S {:}. f={:}, d={:}",
                 describe_drive_edge(graph, check_drive_edge.id()),
-                flow.on_edge(dwell.id()),
-                direction.on_edge(dwell.id())
+                flow.on_edge(stay_on.id()),
+                direction.on_edge(stay_on.id())
             );
-            let next_drive = dwell.post_drive();
+            let next_drive = stay_on.post_drive();
             error!(
                 " B {:}. f={:}, d={:}",
                 describe_drive_edge(graph, next_drive.id()),
@@ -792,17 +1012,17 @@ fn reroute_exceeded_drive_edge(
             "Checking a previous boarding edge due to {:}...",
             describe_drive_edge(graph, original_edge_id)
         );
-        let dwell = check_drive_edge.pre_dwell().unwrap();
-        assert!(direction.on_edge(dwell.id()) > 0.0);
+        let stay_on = check_drive_edge.pre_stay_on().unwrap();
+        assert!(direction.on_edge(stay_on.id()) > 0.0);
         assert!(
-            check_drive_edge.capacity() - flow.on_edge(dwell.id()) <= EPS_L,
-            "Flow on dwell edge is {:}, but capacity is {:}. Flow on drive edge is {:} and flow on board edge is {:}.",
-            flow.on_edge(dwell.id()),
+            check_drive_edge.capacity() - flow.on_edge(stay_on.id()) <= EPS_L,
+            "Flow on stay-on edge is {:}, but capacity is {:}. Flow on drive edge is {:} and flow on boarding edge is {:}.",
+            flow.on_edge(stay_on.id()),
             check_drive_edge.capacity(),
             flow.on_edge(check_drive_edge.id()),
             flow.on_edge(check_drive_edge.pre_boarding().id()),
         );
-        check_drive_edge = dwell.pre_drive();
+        check_drive_edge = stay_on.pre_drive();
     }
 }
 
@@ -853,117 +1073,139 @@ fn reroute_excessors(
     direction: &mut Flow,
 ) -> bool {
     let mut edges_to_check: HashSet<EdgeIdx> = set_new();
-    let mut next_edges_to_check: HashSet<EdgeIdx> = set_new();
 
     for (&edge_idx, &value) in direction.edge_flow_map() {
         if value <= 0.0 {
             continue;
         }
-        next_edges_to_check.insert(edge_idx);
+        edges_to_check.insert(edge_idx);
     }
 
     let mut swap_list: Vec<(PathId, PathId, FVal)> = Vec::new();
 
     let mut found_exceeded_capacity = false;
 
-    while !next_edges_to_check.is_empty() {
-        swap(&mut edges_to_check, &mut next_edges_to_check);
+    let swap_exceeded_edges =
+        |mut edges_to_check: HashSet<EdgeIdx>,
+         direction: &mut Flow,
+         found_exceeded_capacity: &mut bool,
+         paths: &mut PathsIndex,
+         swap_list: &mut Vec<(PathId, PathId, f64)>| {
+            for edge_idx in edges_to_check.drain() {
+                let edge = match graph.nav_edge(edge_idx) {
+                    crate::graph::EdgeNavigate::Drive(edge) => edge,
+                    _ => continue,
+                };
 
-        for edge_idx in edges_to_check.drain() {
-            let edge = match graph.nav_edge(edge_idx) {
-                crate::graph::EdgeNavigate::Drive(edge) => edge,
-                _ => continue,
-            };
+                let slack = edge.capacity() - flow.on_edge(edge_idx);
+                assert!(!slack.is_nan());
+                if slack > EPS_L || direction.on_edge(edge_idx) <= 0.0 {
+                    continue;
+                }
+                // Edge is being exceeded.
+                *found_exceeded_capacity = true;
+                // There is at least one path used (meaning flow or direction is positive)
+                // that boards an already full edge of the same line and which also uses this edge.
+                reroute_exceeded_drive_edge(
+                    edge,
+                    graph,
+                    a_star_table,
+                    paths,
+                    flow,
+                    direction,
+                    swap_list,
+                );
+            }
+        };
 
-            let slack = edge.capacity() - flow.on_edge(edge_idx);
-            assert!(!slack.is_nan());
-            if slack > EPS_L || direction.on_edge(edge_idx) <= 0.0 {
+    // Returns a new set of edges to check.
+    let revert_swaps = |swap_list: &mut Vec<(PathId, PathId, FVal)>,
+                        direction: &mut Flow,
+                        paths: &mut PathsIndex|
+     -> Option<HashSet<EdgeIdx>> {
+        for (path_id, best_response_id, swapped) in swap_list.iter_mut() {
+            if *swapped <= 0.0 {
                 continue;
             }
-            // Edge is being exceeded.
-            found_exceeded_capacity = true;
-            // There is at least one path used (meaning flow or direction is positive)
-            // that boards an already full edge of the same line and which also uses this edge.
-            reroute_exceeded_drive_edge(
-                edge,
-                graph,
-                a_star_table,
-                paths,
-                flow,
-                direction,
-                &mut swap_list,
-            );
-        }
-        if next_edges_to_check.is_empty() {
-            // Now, we revert unnecessary swaps.
-            // TODO: Check if we can somehow avoid the looping here.
-            for (path_id, best_response_id, swapped) in swap_list.iter_mut() {
-                if *swapped <= 0.0 {
-                    continue;
-                }
-                let may_readd = {
-                    let path = paths.path(*path_id);
-                    let best_response = paths.path(*best_response_id);
-                    let mut may_readd = FVal::INFINITY;
-                    for &edge_idx in path.edges() {
-                        let edge = graph.edge(edge_idx);
-                        let drive_edge_id = match edge.edge_type {
-                            EdgeType::Board(_) => graph.node(edge.to).outgoing[0],
-                            _ => continue,
-                        };
-                        let drive_edge = graph.edge(drive_edge_id);
-                        let capacity = match drive_edge.edge_type {
-                            EdgeType::Drive(capacity) => capacity,
-                            _ => panic!("Drive edge is not a drive edge!"),
-                        };
-                        let slack = capacity - flow.on_edge(drive_edge_id);
-                        if slack > EPS_L {
-                            continue;
-                        }
-                        if best_response.edges().contains(&drive_edge_id) {
-                            continue;
-                        }
-                        may_readd = may_readd.min(-direction.on_edge(drive_edge_id));
-                        if may_readd <= 0.0 {
-                            debug!(
-                                "No Revert:    {:?} -> {:?} due to {:}",
-                                path_id,
-                                best_response_id,
-                                describe_drive_edge(graph, drive_edge_id)
-                            );
-                            break;
-                        }
+            let may_readd = {
+                let path = paths.path(*path_id);
+                let best_response = paths.path(*best_response_id);
+                let mut may_readd = FVal::INFINITY;
+                for &edge_idx in path.edges() {
+                    let edge = graph.edge(edge_idx);
+                    let drive_edge_id = match edge.edge_type {
+                        EdgeType::Board(_) => graph.node(edge.to).outgoing[0],
+                        _ => continue,
+                    };
+                    let drive_edge = graph.edge(drive_edge_id);
+                    let capacity = match drive_edge.edge_type {
+                        EdgeType::Drive(capacity) => capacity,
+                        _ => panic!("Drive edge is not a drive edge!"),
+                    };
+                    let slack = capacity - flow.on_edge(drive_edge_id);
+                    if slack > EPS_L {
+                        continue;
                     }
-                    may_readd
-                };
-                let may_remove = {
-                    if flow.on_path(*best_response_id) > 0.0 {
-                        FVal::INFINITY
-                    } else if direction.on_path(*best_response_id) > 0.0 {
-                        direction.on_path(*best_response_id)
-                    } else {
-                        0.0
+                    if best_response.edges().contains(&drive_edge_id) {
+                        continue;
                     }
-                };
-                let may_revert = swapped.min(may_readd).min(may_remove);
-                if may_revert <= 0.0 {
-                    continue;
+                    may_readd = may_readd.min(-direction.on_edge(drive_edge_id));
+                    if may_readd <= 0.0 {
+                        debug!(
+                            "No Revert:    {:?} -> {:?} due to {:}",
+                            path_id,
+                            best_response_id,
+                            describe_drive_edge(graph, drive_edge_id)
+                        );
+                        break;
+                    }
                 }
-                debug!(
-                    "Reverting:  {:} {:?} -> {:?} (may_revert={:})",
-                    swapped, path_id, best_response_id, may_revert
-                );
-                direction.add_flow_onto_path(paths, *path_id, may_revert, false, false);
-                direction.add_flow_onto_path(paths, *best_response_id, -may_revert, false, false);
-                *swapped -= may_revert;
-                for &edge_idx in paths.path(*path_id).edges() {
-                    // TOOD: Check if we can avoid readding edges here (or at least only readd actually relevant edges).
-                    next_edges_to_check.insert(edge_idx);
+                may_readd
+            };
+            let may_remove = {
+                if flow.on_path(*best_response_id) > 0.0 {
+                    FVal::INFINITY
+                } else if direction.on_path(*best_response_id) > 0.0 {
+                    direction.on_path(*best_response_id)
+                } else {
+                    0.0
                 }
-
-                // In an attempt to prevent a loop: First handle possibly new excessed edges.
-                break;
+            };
+            let may_revert = swapped.min(may_readd).min(may_remove);
+            if may_revert <= 0.0 {
+                continue;
             }
+            debug!(
+                "Reverting:  {:} {:?} -> {:?} (may_revert={:})",
+                swapped, path_id, best_response_id, may_revert
+            );
+            direction.add_flow_onto_path(paths, *path_id, may_revert, false, false);
+            direction.add_flow_onto_path(paths, *best_response_id, -may_revert, false, false);
+            *swapped -= may_revert;
+            // In an attempt to prevent a loop: First handle possibly new excessed edges.
+            return Some(paths.path(*path_id).edges().iter().cloned().collect());
+        }
+        return None;
+    };
+
+    const MAX_ITERATIONS: usize = 1000;
+    for i in 0..MAX_ITERATIONS {
+        swap_exceeded_edges(
+            edges_to_check,
+            direction,
+            &mut found_exceeded_capacity,
+            paths,
+            &mut swap_list,
+        );
+
+        if i < MAX_ITERATIONS - 1 {
+            match revert_swaps(&mut swap_list, direction, paths) {
+                Some(edges) => edges_to_check = edges,
+                None => break,
+            }
+        } else {
+            warn!("MAX_ITERATIONS reached. Stopping reverting swaps.");
+            break;
         }
     }
 

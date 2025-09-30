@@ -1,17 +1,77 @@
-use std::cmp::min;
+use std::cmp::{max, min};
 
 use log::info;
+use mcra::MCRA;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
-    a_star::{a_star, AStarTable},
-    best_paths::get_path_prefer_wait_or_dwell,
     col::HashSet,
     flow::Flow,
-    graph::{EdgeIdx, EdgeNavigate, Graph, PathBox, EPS, EPS_L},
-    heuristic::{arrival_of_path, get_longest_feasible_extension},
-    paths_index::{PathId, PathsIndex},
+    graph::{CostCharacteristic, EdgeIdx, EdgeNavigate, EdgeType, Graph, PathBox},
+    heuristic::{FlowStats, get_longest_feasible_extension},
+    opt::Router,
+    path_index::{PathId, PathsIndex},
+    primitives::{EPS, EPS_L, Time},
+    shortest_path::{
+        a_star::AStarTable,
+        best_paths::{find_shortest_path_choice, find_shortest_path_fixed, iter_source_nodes},
+    },
 };
+
+pub fn fill_using_system_optimum(
+    flow: &mut Flow,
+    graph: &Graph,
+    a_star_table: &AStarTable,
+    forbidden_edges: &HashSet<EdgeIdx>,
+    paths: &mut PathsIndex,
+) {
+    let mut mcra: MCRA<gurobi::Model> = MCRA::new();
+    for (edge_id, edge) in graph.edges() {
+        if let EdgeType::Drive(capacity) = edge.edge_type {
+            mcra.add_ressource(edge_id.0 as usize, capacity - flow.on_edge(edge_id));
+        }
+    }
+
+    let mut outside_paths: Vec<PathId> = Vec::new();
+    for (path_id, flow_val) in flow.path_flow_map() {
+        let path = paths.path(*path_id);
+        if !path.is_outside() {
+            continue;
+        }
+        let commodity_idx = path.commodity_idx();
+        let commodity = graph.commodity(commodity_idx);
+        mcra.add_commodity(commodity_idx.0 as usize, *flow_val);
+        mcra.add_bundle(
+            path_id.0 as usize,
+            commodity_idx.0 as usize,
+            path.cost(commodity, graph) as f64,
+            vec![],
+        );
+        outside_paths.push(*path_id);
+    }
+    for path_id in outside_paths {
+        let flow_val = flow.on_path(path_id);
+        flow.add_flow_onto_path(paths, path_id, -flow_val, true, false);
+    }
+
+    info!("Computing system optimum for outside paths.");
+
+    let remaining_flow = mcra.solve(&mut Router {
+        graph,
+        paths,
+        a_star_table,
+        edge_okay: |edge_idx, _| !forbidden_edges.contains(&edge_idx),
+    });
+    for (path_id, flow_val) in remaining_flow {
+        let path_id = PathId(path_id as u32);
+        flow.add_flow_onto_path(paths, path_id, flow_val, true, false);
+    }
+    info!("Done.");
+    info!(
+        "Flow Stats: {:#?}",
+        FlowStats::compute(graph, flow, a_star_table, paths)
+    )
+}
 
 pub fn fill_all_optimal_paths(
     flow: &mut Flow,
@@ -55,6 +115,7 @@ fn fill_optimal_single_round(
         .par_iter()
         .filter_map(|old_path_id| {
             optimal_swap(*old_path_id, paths, graph, a_star_table, full_edges)
+                .map(|it| (*old_path_id, it))
         })
         .collect();
 
@@ -111,45 +172,61 @@ fn optimal_swap(
     graph: &Graph,
     a_star_table: &AStarTable,
     full_edges: &HashSet<EdgeIdx>,
-) -> Option<(PathId, PathBox)> {
+) -> Option<PathBox> {
     let old_path = paths.path(old_path_id);
-    let commodity = graph.commodity(old_path.commodity_idx());
-    let spawn_idx = match commodity.spawn_node {
-        None => return None,
-        Some(it) => it,
-    };
+    let commodity_idx = old_path.commodity_idx();
+    let commodity = graph.commodity(commodity_idx);
     let destination = commodity.od_pair.destination;
-    let max_arrival_time = min(
-        a_star_table.earliest_arrival(spawn_idx, destination),
-        arrival_of_path(old_path, graph, commodity) - 1,
-    );
 
-    let a_star_res = a_star(
-        graph,
-        a_star_table,
-        spawn_idx,
-        destination,
-        |it, _| !full_edges.contains(&it),
-        false,
-        max_arrival_time,
-    );
-
-    let destination_node_idx = match a_star_res.destination {
-        None => return None,
-        Some(it) => it,
-    };
-
-    let path =
-        get_path_prefer_wait_or_dwell(graph, destination_node_idx, spawn_idx, |edge_idx, edge| {
-            a_star_res.astar_reached.contains(&edge.from) && !full_edges.contains(&edge_idx)
-        });
-
-    let path = PathBox::new(old_path.commodity_idx(), path.into_iter());
-
-    debug_assert!(
-        arrival_of_path(path.payload(), graph, commodity)
-            < arrival_of_path(old_path, graph, commodity)
-    );
-
-    Some((old_path_id, path))
+    match &commodity.cost_characteristic {
+        CostCharacteristic::FixedDeparture(fixed) => {
+            let spawn_idx = fixed.spawn_node?;
+            let max_arrival_time = min(
+                a_star_table.earliest_arrival(spawn_idx, destination),
+                old_path.arrival_time(graph, fixed) - 1,
+            );
+            find_shortest_path_fixed(
+                commodity_idx,
+                destination,
+                fixed.spawn_node,
+                max_arrival_time,
+                |it, _| !full_edges.contains(&it),
+                graph,
+                a_star_table,
+                false,
+            )
+        }
+        CostCharacteristic::DepartureTimeChoice(choice) => {
+            let opt_cost = iter_source_nodes(graph, choice)
+                .map(|spawn_idx| {
+                    let arrival = max(
+                        a_star_table.earliest_arrival(spawn_idx, destination),
+                        choice.target_arrival_time,
+                    );
+                    if arrival == Time::MAX {
+                        return Time::MAX;
+                    }
+                    let delay = arrival - choice.target_arrival_time;
+                    let travel_time = arrival - graph.node(spawn_idx).time;
+                    travel_time + delay * choice.delay_penalty_factor
+                })
+                .max();
+            let max_cost = min(
+                old_path.cost_choice(commodity, choice, graph) - 1,
+                opt_cost.unwrap_or(Time::MAX),
+            );
+            find_shortest_path_choice(
+                commodity_idx,
+                choice,
+                commodity.od_pair.origin,
+                destination,
+                max_cost,
+                |it, _| !full_edges.contains(&it),
+                graph,
+                a_star_table,
+                false,
+            )
+        }
+    }
+    .0
 }

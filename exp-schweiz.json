@@ -1,10 +1,10 @@
 {
-    "folder": "data/hamburg",
-    "nominalDemand": 750000,
-    "defaultVehicleCapacity": 1000,
+    "folder": "data/swiss",
+    "nominalDemand": 1347686,
+    "rolls": 10,
+    "rollsWithoutDemand": 1,
     "timeUnitsInHour": 60,
-    "rolls": 108,
-    "rollsWithoutDemand": 6,
+    "defaultVehicleCapacity": 1000,
     "commodityGenerationInterval": 10,
     "outsideOption": 180,
     "demands": [
